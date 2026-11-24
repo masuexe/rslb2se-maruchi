@@ -1,0 +1,8 @@
+LIBRARY maruchi_net
+EXPORTS
+    maruchi_connect
+    maruchi_disconnect
+    maruchi_state
+    maruchi_send
+    maruchi_poll
+    maruchi_last_error
