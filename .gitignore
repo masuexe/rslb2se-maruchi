@@ -1,0 +1,30 @@
+# Local archives and extracted game binaries/assets (never commit copyrighted game files)
+.local/
+game/
+game_extracted/
+*.zip
+*.rar
+*.7z
+
+# Backups and runtime logs
+*.orig
+*.bak
+logs/
+*.log
+
+# Build artifacts
+target/
+build/
+dist/
+*.dll
+*.so
+*.exe
+*.pdb
+
+# Python / OS / IDE
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
