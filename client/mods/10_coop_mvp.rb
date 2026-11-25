@@ -410,6 +410,8 @@ if Maruchi::Config::MODS[:coop_client]
       @rtt_ms = nil
       @last_transfer_req_at = 0.0
       @last_transfer_req_map = nil
+      @last_interact_req_at = 0.0
+      @server_error_note = nil
       @last_state = Maruchi::Net::STATE_DISCONNECTED
       @status_note = "F7:Join  F8:Menu"
 
@@ -512,6 +514,7 @@ if Maruchi::Config::MODS[:coop_client]
         @remote_players.clear
         @remote_tokens.clear
         @enemy_targets.clear
+        @server_error_note = nil
         @status_note = "Connecting..."
         Maruchi::Log.info("Connecting to #{host}:#{port} as '#{Maruchi::Config::PLAYER_NAME}'...")
         Maruchi::Net.connect(host, port)
@@ -615,6 +618,9 @@ if Maruchi::Config::MODS[:coop_client]
 
       def self.request_interact
         return unless connected? && $game_player
+        now = Time.now.to_f
+        return if (now - @last_interact_req_at) < 0.25
+        @last_interact_req_at = now
         Maruchi::Net.send_msg(Maruchi::Protocol.build_req_interact($game_player.x, $game_player.y, $game_player.direction))
       end
 
@@ -626,11 +632,11 @@ if Maruchi::Config::MODS[:coop_client]
           @last_state = st
           if st == Maruchi::Net::STATE_ERROR
             err = Maruchi::Net.last_error
-            @status_note = "Err (F7 retry)"
+            @status_note = @server_error_note || "Err (F7 retry)"
             @welcomed = false
             Maruchi::Log.error("Network error: #{err}")
           elsif st == Maruchi::Net::STATE_DISCONNECTED
-            @status_note = "Disconnected (F7)"
+            @status_note = @server_error_note || "Disconnected (F7)"
             @welcomed = false
           end
         end
@@ -1007,6 +1013,13 @@ if Maruchi::Config::MODS[:coop_client]
           tr_kind   = f[3].to_i
           tr_id     = f[4].to_i
           handle_treasure_pickup(picker_id, tr_kind, tr_id)
+
+        when "ERROR"
+          code = Maruchi::Protocol.unesc(f[2])
+          msg  = f.length > 3 ? Maruchi::Protocol.unesc(f[3]) : code
+          @server_error_note = (code == "VERSION_MISMATCH") ? "Ver mismatch!" : "Err: #{code}"
+          @status_note = @server_error_note
+          Maruchi::Log.error("Server ERROR [#{code}]: #{msg}")
 
         when "JOIN", "LEAVE"
           Maruchi::Log.info("Server EVENT: #{kind} #{f[2..-1].inspect}")
@@ -1498,6 +1511,18 @@ if Maruchi::Config::MODS[:coop_client]
     def movable?
       return false if Maruchi::Coop.connected? && (Maruchi::Coop.my_downed? || Maruchi::Coop.cutscene_locked?)
       maruchi_coop_movable?
+    end
+
+    if method_defined?(:check_action_event)
+      alias maruchi_coop_check_action_event check_action_event
+      def check_action_event
+        if Maruchi::Coop.connected?
+          return false if Maruchi::Coop.my_downed? || Maruchi::Coop.cutscene_locked?
+          Maruchi::Coop.request_interact
+          return true
+        end
+        maruchi_coop_check_action_event
+      end
     end
 
     if method_defined?(:can_use_command?)

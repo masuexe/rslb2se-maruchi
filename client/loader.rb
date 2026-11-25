@@ -3,7 +3,7 @@
 # Loaded by the tiny bootstrap injected into game/Data/Scripts.rvdata
 #==============================================================================
 module Maruchi
-  VERSION = "0.1.0-dev"
+  VERSION = "0.1.0"
   CLIENT_DIR = File.dirname(File.expand_path($MARUCHI_LOADER_PATH || __FILE__))
   ROOT_DIR = File.expand_path("..", CLIENT_DIR)
   SHARED_DIR = File.join(ROOT_DIR, "shared")
@@ -78,6 +78,9 @@ module Maruchi
       eval_file(File.join(Maruchi::CLIENT_DIR, "config.rb"))
       Maruchi::Log.init
       Maruchi::Log.info("Maruchi v#{Maruchi::VERSION} booting (Ruby #{RUBY_VERSION}, pwd=#{Dir.pwd})")
+      if defined?(Maruchi::Config::INI_PATH) && Maruchi::Config::INI_PATH
+        Maruchi::Log.info("Loaded config from #{Maruchi::Config::INI_PATH} (host=#{Maruchi::Config::SERVER_HOST}:#{Maruchi::Config::SERVER_PORT}, name=#{Maruchi::Config::PLAYER_NAME})")
+      end
       load_dir(Maruchi::SHARED_DIR)
       load_dir(File.join(Maruchi::CLIENT_DIR, "core"))
       load_dir(File.join(Maruchi::CLIENT_DIR, "mods"))

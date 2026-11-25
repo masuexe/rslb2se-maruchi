@@ -269,6 +269,7 @@ def build_bootstrap_code(loader_rel_path: str) -> bytes:
 #==============================================================================
 module MaruchiBootstrap
   LOADER_CANDIDATES = [
+    File.expand_path("maruchi/client/loader.rb", Dir.pwd),
     File.expand_path("{loader_rel_path}", Dir.pwd),
     File.expand_path("../{loader_rel_path}", Dir.pwd),
     "{loader_rel_path}"

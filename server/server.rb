@@ -15,8 +15,10 @@ require_relative "../shared/protocol"
 
 module Maruchi
   class ClientSession
-    MAX_FRAME_LEN = 1024 * 1024
-    REVIVE_TICKS  = 300 # 5 seconds at 60Hz (4x faster when an ally stands nearby)
+    MAX_FRAME_LEN       = 1024 * 1024
+    REVIVE_TICKS        = 300 # 5 seconds at 60Hz (4x faster when an ally stands nearby)
+    AUTH_TIMEOUT_SECS   = 15.0
+    IDLE_TIMEOUT_SECS   = 30.0
 
     attr_reader :id, :socket, :peer
     attr_accessor :name, :actor_id, :team, :authed
@@ -1276,7 +1278,15 @@ module Maruchi
 
       case fields[0]
       when "HELLO"
-        _ver = fields[1].to_i
+        ver = fields[1].to_i
+        if ver != Maruchi::Protocol::VERSION
+          msg = "Protocol mismatch: client v#{ver}, server v#{Maruchi::Protocol::VERSION}"
+          log("WARN Client ##{session.id} (#{session.peer}) rejected: #{msg}")
+          session.queue_frame(Maruchi::Protocol.build_event("ERROR", "VERSION_MISMATCH", msg))
+          session.flush_writes
+          session.close!
+          return
+        end
         name = Maruchi::Protocol.unesc(fields[2])
         actor_id = fields[3].to_i
         session.name = name unless name.empty?
@@ -1397,6 +1407,7 @@ module Maruchi
 
       when "REQ_INTERACT"
         return unless session.alive?
+        return if @cutscene_locked
         ix   = fields[1].to_i
         iy   = fields[2].to_i
         idir = fields[3].to_i
@@ -1406,8 +1417,9 @@ module Maruchi
         with_session_context(session) do
           begin
             po = session.player_obj
-            po.check_event_trigger_here([0, 1, 2]) if po.respond_to?(:check_event_trigger_here)
-            po.check_event_trigger_there([0, 1, 2]) if po.respond_to?(:check_event_trigger_there)
+            triggered = false
+            triggered = po.check_event_trigger_here([0]) if po.respond_to?(:check_event_trigger_here)
+            po.check_event_trigger_there([0, 1, 2]) if !triggered && po.respond_to?(:check_event_trigger_there)
           rescue StandardError => e
             log("WARN interact error for player ##{session.id}: #{e.class}: #{e.message}")
           end
@@ -1490,15 +1502,25 @@ module Maruchi
     end
 
     def flush_and_cleanup_clients
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       disconnected = []
       @sessions.each do |pid, s|
-        s.flush_writes unless s.closed
+        unless s.closed
+          idle = now - s.last_seen_at
+          limit = s.authed ? ClientSession::IDLE_TIMEOUT_SECS : ClientSession::AUTH_TIMEOUT_SECS
+          if idle > limit
+            log("Client ##{pid} ('#{s.name}') timed out after #{idle.round(1)}s (authed=#{s.authed})")
+            s.close!
+          else
+            s.flush_writes
+          end
+        end
         disconnected << pid if s.closed
       end
       disconnected.each do |pid|
         s = @sessions.delete(pid)
         log("Client ##{pid} ('#{s.name}') disconnected (online=#{@sessions.size})")
-        broadcast_frame(Maruchi::Protocol.build_event("LEAVE", pid, s.name))
+        broadcast_frame(Maruchi::Protocol.build_event("LEAVE", pid, s.name)) if s.authed
       end
       elect_host! unless disconnected.empty?
     end
