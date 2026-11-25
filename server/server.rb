@@ -236,6 +236,12 @@ module Maruchi
       @pending_transfer = nil
       @last_transfer_map_id = nil
       @last_transfer_tick = -999
+      @host_id = nil
+      @msg_seq_counter = 0
+      @active_msg_seq = 0
+      @active_msg_frame = nil
+      @cutscene_locked = false
+      @pending_bgm = nil
       @active_context_session = nil
     end
 
@@ -320,6 +326,7 @@ module Maruchi
 
     def step_tick!
       @pending_se.clear
+      @pending_bgm = nil
       @pending_dead_enemies.clear
       @pending_knockbacks.clear
 
@@ -340,6 +347,8 @@ module Maruchi
       if !@sessions.empty?
         authed_sessions = @sessions.values.select { |s| s.authed && !s.closed }
         unless authed_sessions.empty?
+          elect_host! if @host_id.nil? || !@sessions[@host_id] || @sessions[@host_id].closed
+
           authed_sessions.each do |session|
             update_session_tick!(session, authed_sessions)
           end
@@ -349,11 +358,14 @@ module Maruchi
             begin
               $game_system.update
               $game_map.update
+              $game_map.interpreter.update
               update_server_enemy_collapses!
             rescue StandardError => e
               log("WARN tick ##{@tick} world update error: #{e.class}: #{e.message}")
             end
           end
+
+          sync_server_cutscene_and_message!
 
           # Apply map transfer if a server event / interpreter triggered reserve_transfer during map tick
           if @pending_transfer
@@ -386,6 +398,79 @@ module Maruchi
       key = filename.to_s
       return if @pending_se.any? { |s| s[0] == key }
       @pending_se << [key, volume.to_i, pitch.to_i]
+    end
+
+    def record_bgm(filename, volume, pitch)
+      return unless @capture_se
+      @pending_bgm = [:play, filename.to_s, volume.to_i, pitch.to_i]
+    end
+
+    def record_bgm_stop
+      return unless @capture_se
+      @pending_bgm = [:stop]
+    end
+
+    def elect_host!
+      authed_ids = @sessions.values.select { |s| s.authed && !s.closed }.map(&:id).sort
+      new_host = authed_ids.first
+      if new_host != @host_id
+        @host_id = new_host
+        log("Host elected: #{@host_id ? "Player ##{@host_id}" : 'none'}")
+        broadcast_frame(Maruchi::Protocol.build_event("HOST_CHANGE", @host_id.to_i)) if @host_id
+      end
+      # If room became completely empty while a message was open, clear it so server doesn't stall
+      if @host_id.nil? && $game_message && $game_message.busy
+        advance_server_message!(-1)
+      end
+    end
+
+    def sync_server_cutscene_and_message!
+      # Detect new authoritative RPG Maker dialogue / choice triggered by map/common interpreter
+      if $game_message && $game_message.busy && @active_msg_seq == 0
+        @msg_seq_counter += 1
+        @active_msg_seq = @msg_seq_counter
+        texts_blob = ($game_message.texts || []).map { |t| Maruchi::Protocol.esc(t) }.join(";")
+        frame = Maruchi::Protocol.build_event(
+          "MSG_SHOW",
+          @active_msg_seq,
+          $game_message.face_name.to_s,
+          $game_message.face_index.to_i,
+          $game_message.background.to_i,
+          $game_message.position.to_i,
+          $game_message.choice_start.to_i,
+          $game_message.choice_max.to_i,
+          $game_message.choice_cancel_type.to_i,
+          texts_blob
+        )
+        @active_msg_frame = frame
+        log("Cutscene MSG_SHOW ##{@active_msg_seq} (host=P##{@host_id}, lines=#{$game_message.texts.size}, choices=#{$game_message.choice_max})")
+        broadcast_frame(frame)
+      elsif (!$game_message || !$game_message.busy) && @active_msg_seq != 0
+        closed_seq = @active_msg_seq
+        @active_msg_seq = 0
+        @active_msg_frame = nil
+        broadcast_frame(Maruchi::Protocol.build_event("MSG_CLOSE", closed_seq))
+      end
+
+      in_cutscene = !!($game_map.interpreter.running? || ($game_message && $game_message.busy) || @active_msg_seq > 0)
+      if in_cutscene != @cutscene_locked
+        @cutscene_locked = in_cutscene
+        log("Cutscene lock -> #{@cutscene_locked}")
+        broadcast_frame(Maruchi::Protocol.build_event("CUTSCENE", @cutscene_locked ? 1 : 0))
+      end
+    end
+
+    def advance_server_message!(choice_idx = -1)
+      return unless $game_message && $game_message.busy
+      closed_seq = @active_msg_seq
+      c_proc = $game_message.choice_proc
+      m_proc = $game_message.main_proc
+      c_proc.call(choice_idx.to_i) if c_proc && choice_idx.to_i >= 0
+      $game_message.clear
+      m_proc.call if m_proc
+      @active_msg_seq = 0
+      @active_msg_frame = nil
+      broadcast_frame(Maruchi::Protocol.build_event("MSG_CLOSE", closed_seq)) if closed_seq > 0
     end
 
     def record_enemy_defeated(ev, enemy)
@@ -444,6 +529,15 @@ module Maruchi
 
       $game_map.clear_tokens if $game_map.respond_to?(:clear_tokens)
       $game_map.interpreter.clear if $game_map.interpreter
+      if $game_message && $game_message.busy
+        $game_message.clear
+      end
+      @active_msg_seq = 0
+      @active_msg_frame = nil
+      if @cutscene_locked
+        @cutscene_locked = false
+        broadcast_frame(Maruchi::Protocol.build_event("CUTSCENE", 0))
+      end
       $game_map.setup(mid)
       @map_id = mid
 
@@ -600,7 +694,7 @@ module Maruchi
 
     def check_session_enemy_collision!(session)
       return unless session.alive?
-      return if $game_map.interpreter.running?
+      return if @cutscene_locked || $game_map.interpreter.running?
       $game_map.events.each_value do |ev|
         next if ev.erased
         next unless ev.respond_to?(:collision_attack) && ev.collision_attack
@@ -753,6 +847,24 @@ module Maruchi
             srv = $MARUCHI_SERVER
             srv.record_se(filename, volume, pitch) if srv
             maruchi_orig_se_play(filename, volume, pitch)
+          end
+
+          if respond_to?(:bgm_play)
+            alias_method :maruchi_orig_bgm_play, :bgm_play
+            def bgm_play(filename, volume = 100, pitch = 100)
+              srv = $MARUCHI_SERVER
+              srv.record_bgm(filename, volume, pitch) if srv
+              maruchi_orig_bgm_play(filename, volume, pitch)
+            end
+          end
+
+          if respond_to?(:bgm_stop)
+            alias_method :maruchi_orig_bgm_stop, :bgm_stop
+            def bgm_stop
+              srv = $MARUCHI_SERVER
+              srv.record_bgm_stop if srv
+              maruchi_orig_bgm_stop
+            end
           end
         end
       end
@@ -1089,6 +1201,14 @@ module Maruchi
       @pending_se.each do |se_name, vol, pitch|
         broadcast_frame(Maruchi::Protocol.build_event("FX_SE", se_name, vol, pitch))
       end
+
+      if @pending_bgm
+        if @pending_bgm[0] == :play
+          broadcast_frame(Maruchi::Protocol.build_event("FX_BGM", @pending_bgm[1], @pending_bgm[2], @pending_bgm[3]))
+        else
+          broadcast_frame(Maruchi::Protocol.build_event("FX_BGM_STOP"))
+        end
+      end
     end
 
     def find_safe_spawn(map)
@@ -1166,7 +1286,15 @@ module Maruchi
         session.queue_frame(
           Maruchi::Protocol.build_welcome(session.id, @map_id, @spawn_x, @spawn_y, @mode, @tick_rate)
         )
+        elect_host!
+        session.queue_frame(Maruchi::Protocol.build_event("HOST_CHANGE", @host_id.to_i)) if @host_id
         send_world_state_to(session)
+        if @cutscene_locked
+          session.queue_frame(Maruchi::Protocol.build_event("CUTSCENE", 1))
+        end
+        if @active_msg_frame
+          session.queue_frame(@active_msg_frame)
+        end
         broadcast_frame(
           Maruchi::Protocol.build_event("JOIN", session.id, session.name),
           exclude_id: session.id
@@ -1209,6 +1337,7 @@ module Maruchi
 
       when "ACTION"
         return unless session.alive?
+        return if @cutscene_locked
         kind = Maruchi::Protocol.unesc(fields[1])
         action_id = fields[2].to_i
         return if action_id <= 0
@@ -1282,6 +1411,14 @@ module Maruchi
           rescue StandardError => e
             log("WARN interact error for player ##{session.id}: #{e.class}: #{e.message}")
           end
+        end
+
+      when "MSG_ACK"
+        seq        = fields[1].to_i
+        choice_idx = fields.length > 2 ? fields[2].to_i : -1
+        if session.id == @host_id && seq == @active_msg_seq && seq > 0
+          log("Host P##{session.id} advanced MSG ##{seq} (choice=#{choice_idx})")
+          advance_server_message!(choice_idx)
         end
 
       when "PING"
@@ -1363,6 +1500,7 @@ module Maruchi
         log("Client ##{pid} ('#{s.name}') disconnected (online=#{@sessions.size})")
         broadcast_frame(Maruchi::Protocol.build_event("LEAVE", pid, s.name))
       end
+      elect_host! unless disconnected.empty?
     end
 
     def shutdown!

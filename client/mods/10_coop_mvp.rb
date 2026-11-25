@@ -395,6 +395,11 @@ if Maruchi::Config::MODS[:coop_client]
       @my_down_timer = 0
       @server_map_id = nil
       @server_mode = "coop"
+      @host_id = nil
+      @cutscene_locked = false
+      @synced_msg_seq = 0
+      @pending_msg_close = false
+      @pending_msg_show = nil
       @applying_server_map = false
       @remote_players = {}
       @remote_tokens  = {}
@@ -411,6 +416,12 @@ if Maruchi::Config::MODS[:coop_client]
       def self.active?;              @active;              end
       def self.connected?;           @welcomed && Maruchi::Net.connected?; end
       def self.my_id;                @my_id;               end
+      def self.host_id;              @host_id;             end
+      def self.is_host?;             connected? && @my_id && @host_id && @my_id == @host_id; end
+      def self.cutscene_locked?;     connected? && (@cutscene_locked || @synced_msg_seq > 0); end
+      def self.synced_msg_seq;       @synced_msg_seq;      end
+      def self.pending_msg_close?;   @pending_msg_close;   end
+      def self.pending_msg_show;     @pending_msg_show;    end
       def self.server_mode;          @server_mode;         end
       def self.server_map_id;        @server_map_id;       end
       def self.my_downed?;           @my_down_timer > 0;   end
@@ -418,12 +429,30 @@ if Maruchi::Config::MODS[:coop_client]
       def self.remote_players;       @remote_players;      end
       def self.remote_tokens;        @remote_tokens;       end
 
+      def self.consume_pending_msg_close!
+        @pending_msg_close = false
+        @synced_msg_seq = 0
+      end
+
+      def self.consume_pending_msg_show!
+        msg = @pending_msg_show
+        @pending_msg_show = nil
+        msg
+      end
+
+      def self.send_msg_ack(seq, choice_idx = -1)
+        return unless connected? && is_host? && seq.to_i > 0
+        Maruchi::Net.send_msg(Maruchi::Protocol.build_msg_ack(seq.to_i, choice_idx.to_i))
+        @synced_msg_seq = 0 if @synced_msg_seq == seq.to_i
+      end
+
       def self.hud_text
         if connected?
           cnt = @remote_players.size + 1
           ping_str = @rtt_ms ? " #{@rtt_ms}ms" : ""
           mode_tag = (@server_mode == "pvp") ? "PVP" : "COOP"
-          return "#{mode_tag} P##{@my_id} (#{cnt}P)#{ping_str} [F8]"
+          host_mark = is_host? ? "*" : ""
+          return "#{mode_tag} P##{@my_id}#{host_mark} (#{cnt}P)#{ping_str} [F8]"
         elsif @active && Maruchi::Net.connecting?
           return "COOP Connecting..."
         else
@@ -434,9 +463,10 @@ if Maruchi::Config::MODS[:coop_client]
       def self.party_hud_rows
         return [] unless connected?
         rows = []
+        my_prefix = is_host? ? "[H] " : ""
         rows.push({
           :id       => @my_id.to_i,
-          :name     => Maruchi::Config::PLAYER_NAME.to_s,
+          :name     => my_prefix + Maruchi::Config::PLAYER_NAME.to_s,
           :hp       => @my_hp.to_i,
           :maxhp    => [@my_maxhp.to_i, 1].max,
           :mp       => @my_mp.to_i,
@@ -446,9 +476,10 @@ if Maruchi::Config::MODS[:coop_client]
         })
         @remote_players.keys.sort.each do |pid|
           rp = @remote_players[pid]
+          r_prefix = (@host_id && pid == @host_id) ? "[H] " : ""
           rows.push({
             :id       => pid,
-            :name     => rp.player_name.to_s,
+            :name     => r_prefix + rp.player_name.to_s,
             :hp       => rp.hp.to_i,
             :maxhp    => [rp.maxhp.to_i, 1].max,
             :mp       => rp.mp.to_i,
@@ -472,6 +503,11 @@ if Maruchi::Config::MODS[:coop_client]
         @hello_sent = false
         @welcomed = false
         @my_id = nil
+        @host_id = nil
+        @cutscene_locked = false
+        @synced_msg_seq = 0
+        @pending_msg_close = false
+        @pending_msg_show = nil
         @my_down_timer = 0
         @remote_players.clear
         @remote_tokens.clear
@@ -487,6 +523,11 @@ if Maruchi::Config::MODS[:coop_client]
         @hello_sent = false
         @welcomed = false
         @my_id = nil
+        @host_id = nil
+        @cutscene_locked = false
+        @synced_msg_seq = 0
+        @pending_msg_close = false
+        @pending_msg_show = nil
         @my_down_timer = 0
         @remote_players.clear
         @remote_tokens.clear
@@ -761,6 +802,61 @@ if Maruchi::Config::MODS[:coop_client]
       def self.handle_server_event(f)
         kind = Maruchi::Protocol.unesc(f[1])
         case kind
+        when "HOST_CHANGE"
+          @host_id = f[2].to_i
+          Maruchi::Log.info("Room host is now P##{@host_id} (is_host=#{is_host?})")
+
+        when "CUTSCENE"
+          @cutscene_locked = (f[2].to_i != 0)
+          Maruchi::Log.info("Cutscene lock -> #{@cutscene_locked}")
+
+        when "MSG_SHOW"
+          seq        = f[2].to_i
+          face_name  = Maruchi::Protocol.unesc(f[3])
+          face_index = f[4].to_i
+          bg         = f[5].to_i
+          pos        = f[6].to_i
+          c_start    = f[7].to_i
+          c_max      = f[8].to_i
+          c_cancel   = f[9].to_i
+          raw_texts  = Maruchi::Protocol.unesc(f[10])
+          lines      = raw_texts.empty? ? [] : raw_texts.split(";", -1).collect { |s| Maruchi::Protocol.unesc(s) }
+          @synced_msg_seq = seq
+          @pending_msg_close = false
+          @pending_msg_show = {
+            :seq          => seq,
+            :face_name    => face_name,
+            :face_index   => face_index,
+            :background   => bg,
+            :position     => pos,
+            :choice_start => c_start,
+            :choice_max   => c_max,
+            :choice_cancel => c_cancel,
+            :texts        => lines
+          }
+
+        when "MSG_CLOSE"
+          seq = f[2].to_i
+          if @synced_msg_seq == 0 || @synced_msg_seq == seq
+            @pending_msg_show = nil
+            @pending_msg_close = true
+          end
+
+        when "FX_BGM"
+          bgm_name = Maruchi::Protocol.unesc(f[2])
+          vol      = f[3].to_i
+          pitch    = f[4].to_i
+          begin
+            Audio.bgm_play(bgm_name, vol > 0 ? vol : 80, pitch > 0 ? pitch : 100)
+          rescue Exception
+          end
+
+        when "FX_BGM_STOP"
+          begin
+            Audio.bgm_stop
+          rescue Exception
+          end
+
         when "SW_SET"
           sid = f[2].to_i
           val = (f[3].to_i != 0)
@@ -1222,9 +1318,137 @@ if Maruchi::Config::MODS[:coop_client]
   end
 
   #----------------------------------------------------------------------------
-  # Hook Game_Event: Suppress local AI, enemy hits, contact hits & defeat math
+  # Hook Window_Message: Host-driven synchronized cutscene dialogue & choices
+  # - Server drives $game_message; all clients display identical text/portrait
+  # - Only the room host can advance/close synced dialogue or pick choices
+  # - Non-host clients stay in sync and close/advance immediately on server cue
+  #----------------------------------------------------------------------------
+  class Window_Message < Window_Selectable
+    alias maruchi_coop_msg_update update
+    def update
+      if Maruchi::Coop.connected?
+        if Maruchi::Coop.pending_msg_close?
+          Maruchi::Coop.consume_pending_msg_close!
+          if $game_message && $game_message.visible
+            maruchi_force_close_message
+          elsif $game_message && $game_message.busy
+            $game_message.clear
+          end
+        end
+
+        new_msg = Maruchi::Coop.consume_pending_msg_show!
+        if new_msg && $game_message
+          # Close any stale message cleanly before loading the authoritative one
+          if $game_message.visible || $game_message.busy
+            maruchi_force_close_message
+          end
+          $game_message.clear
+          $game_message.face_name          = new_msg[:face_name]
+          $game_message.face_index         = new_msg[:face_index]
+          $game_message.background         = new_msg[:background]
+          $game_message.position           = new_msg[:position]
+          $game_message.choice_start       = new_msg[:choice_start]
+          $game_message.choice_max         = new_msg[:choice_max]
+          $game_message.choice_cancel_type = new_msg[:choice_cancel]
+          new_msg[:texts].each { |ln| $game_message.texts.push(ln) }
+          @maruchi_synced_seq = new_msg[:seq]
+        end
+      end
+      maruchi_coop_msg_update
+    end
+
+    def maruchi_force_close_message
+      @maruchi_forcing_close = true
+      begin
+        terminate_message
+        @text = nil
+        @wait_count = 0
+        @opening = false
+        @closing = false
+      ensure
+        @maruchi_forcing_close = false
+        @maruchi_synced_seq = 0
+      end
+    end
+
+    alias maruchi_coop_input_pause input_pause
+    def input_pause
+      if Maruchi::Coop.connected? && @maruchi_synced_seq.to_i > 0
+        if Input.trigger?(Input::B) || Input.trigger?(Input::C)
+          if @text != nil && !@text.empty?
+            # Multi-page single message: allow local page flip within same message
+            self.pause = false
+            new_page if @line_count >= MAX_LINE
+          elsif Maruchi::Coop.is_host?
+            # Host advances the authoritative server message
+            seq = @maruchi_synced_seq
+            @maruchi_synced_seq = 0
+            self.pause = false
+            terminate_message
+            Maruchi::Coop.send_msg_ack(seq, -1)
+          end
+        end
+        return
+      end
+      maruchi_coop_input_pause
+    end
+
+    alias maruchi_coop_input_choice input_choice
+    def input_choice
+      if Maruchi::Coop.connected? && @maruchi_synced_seq.to_i > 0
+        # Non-host waits for host's choice
+        return unless Maruchi::Coop.is_host?
+        if Input.trigger?(Input::B)
+          if $game_message.choice_cancel_type > 0
+            Sound.play_cancel
+            seq = @maruchi_synced_seq
+            choice_idx = $game_message.choice_cancel_type - 1
+            @maruchi_synced_seq = 0
+            terminate_message
+            Maruchi::Coop.send_msg_ack(seq, choice_idx)
+          end
+        elsif Input.trigger?(Input::C)
+          Sound.play_decision
+          seq = @maruchi_synced_seq
+          choice_idx = self.index
+          @maruchi_synced_seq = 0
+          terminate_message
+          Maruchi::Coop.send_msg_ack(seq, choice_idx)
+        end
+        return
+      end
+      maruchi_coop_input_choice
+    end
+
+    alias maruchi_coop_terminate_message terminate_message
+    def terminate_message
+      # Handle \^ (@pause_skip) auto-advancing synced messages from host
+      if !@maruchi_forcing_close && Maruchi::Coop.connected? && @maruchi_synced_seq.to_i > 0
+        if Maruchi::Coop.is_host?
+          seq = @maruchi_synced_seq
+          @maruchi_synced_seq = 0
+          maruchi_coop_terminate_message
+          Maruchi::Coop.send_msg_ack(seq, -1)
+          return
+        end
+      end
+      maruchi_coop_terminate_message
+    end
+  end
+
+  #----------------------------------------------------------------------------
+  # Hook Game_Event: Suppress local AI, autorun cutscenes, enemy hits & defeat
   #----------------------------------------------------------------------------
   class Game_Event
+    if method_defined?(:check_event_trigger_auto)
+      alias maruchi_coop_check_event_trigger_auto check_event_trigger_auto
+      def check_event_trigger_auto
+        # Autorun (trigger == 3) cutscenes run authoritatively on server and stream to all clients
+        return if Maruchi::Coop.connected?
+        maruchi_coop_check_event_trigger_auto
+      end
+    end
+
     alias maruchi_coop_update_self_movement update_self_movement
     def update_self_movement
       if Maruchi::Coop.connected? && respond_to?(:battler) && battler.is_a?(Game_Enemy)
@@ -1272,14 +1496,14 @@ if Maruchi::Config::MODS[:coop_client]
 
     alias maruchi_coop_movable? movable?
     def movable?
-      return false if Maruchi::Coop.connected? && Maruchi::Coop.my_downed?
+      return false if Maruchi::Coop.connected? && (Maruchi::Coop.my_downed? || Maruchi::Coop.cutscene_locked?)
       maruchi_coop_movable?
     end
 
     if method_defined?(:can_use_command?)
       alias maruchi_coop_can_use_command? can_use_command?
       def can_use_command?
-        return false if Maruchi::Coop.connected? && Maruchi::Coop.my_downed?
+        return false if Maruchi::Coop.connected? && (Maruchi::Coop.my_downed? || Maruchi::Coop.cutscene_locked?)
         maruchi_coop_can_use_command?
       end
     end
@@ -1312,7 +1536,7 @@ if Maruchi::Config::MODS[:coop_client]
       alias maruchi_coop_shoot shoot
       def shoot(action_id)
         if Maruchi::Coop.connected? && action_id.to_i > 0
-          return if Maruchi::Coop.my_downed?
+          return if Maruchi::Coop.my_downed? || Maruchi::Coop.cutscene_locked?
           @maruchi_top_shoot = (@force_action_times.to_i == 0)
         else
           @maruchi_top_shoot = false

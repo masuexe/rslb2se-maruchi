@@ -85,6 +85,10 @@ module Maruchi
       pack("REQ_INTERACT", x.to_i, y.to_i, dir.to_i)
     end
 
+    def self.build_msg_ack(msg_seq, choice_idx = -1)
+      pack("MSG_ACK", msg_seq.to_i, choice_idx.to_i)
+    end
+
     def self.build_ping(client_ms)
       pack("PING", client_ms.to_i)
     end
