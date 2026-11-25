@@ -2,8 +2,9 @@
 
 #==============================================================================
 # Maruchi Cross-Platform Authoritative Headless Server (Linux & Windows)
+# Step 4.2: Multi-player Hit Detection, Independent HP/MP, Down/Revive & PvP
 # Usage:
-#   ruby server/server.rb [--host 0.0.0.0] [--port 27890] [--map 116] [--game-dir ./game]
+#   ruby server/server.rb [--host 0.0.0.0] [--port 27890] [--map 116] [--mode coop|pvp]
 #==============================================================================
 
 require "optparse"
@@ -14,12 +15,13 @@ require_relative "../shared/protocol"
 module Maruchi
   class ClientSession
     MAX_FRAME_LEN = 1024 * 1024
+    REVIVE_TICKS  = 300 # 5 seconds at 60Hz (4x faster when an ally stands nearby)
 
     attr_reader :id, :socket, :peer
     attr_accessor :name, :actor_id, :team, :authed
     attr_accessor :x, :y, :real_x, :real_y, :dir, :dir8, :moving
     attr_accessor :char_name, :char_index, :pattern, :step_anime
-    attr_accessor :hp, :maxhp, :mp, :maxmp
+    attr_accessor :hp, :maxhp, :mp, :maxmp, :down_timer
     attr_accessor :actor, :player_obj, :last_seen_at, :closed
 
     def initialize(id, socket, spawn_x, spawn_y, default_actor_id = 1)
@@ -49,13 +51,14 @@ module Maruchi
       @moving = false
       @pattern = 1
       @step_anime = false
+      @down_timer = 0
 
       @player_obj = Game_Player.new
       @player_obj.moveto(@x, @y)
       @player_obj.refresh
       @player_obj.instance_variable_set(:@maruchi_session_id, @id)
 
-      # Give each player their own authoritative battler reference
+      # Give each player their own authoritative battler & session link
       @player_obj.define_singleton_method(:battler) do
         @maruchi_actor || ($game_party && $game_party.members[0])
       end
@@ -66,19 +69,35 @@ module Maruchi
       set_actor!(default_actor_id)
     end
 
+    def downed?
+      @down_timer > 0
+    end
+
+    def alive?
+      !@closed && @authed && !downed? && @actor && @actor.hp > 0
+    end
+
     def set_actor!(aid)
       aid = 1 unless aid.to_i > 0 && $data_actors && $data_actors[aid.to_i]
       @actor_id = aid.to_i
       @actor = Game_Actor.new(@actor_id)
+      @actor.recover_all
+      @actor.invunerable_duration = 120 if @actor.respond_to?(:invunerable_duration=)
       @player_obj.instance_variable_set(:@maruchi_actor, @actor)
       data_actor = $data_actors[@actor_id]
       @char_name  = data_actor ? data_actor.character_name.to_s : ""
       @char_index = data_actor ? data_actor.character_index.to_i : 0
-      @hp    = @actor.hp
-      @maxhp = @actor.maxhp
-      @mp    = @actor.mp
-      @maxmp = @actor.maxmp
+      @down_timer = 0
+      refresh_vitals!
       sync_player_obj!
+    end
+
+    def refresh_vitals!
+      return unless @actor
+      @hp    = @actor.hp.to_i
+      @maxhp = [@actor.maxhp.to_i, 1].max
+      @mp    = @actor.mp.to_i
+      @maxmp = @actor.maxmp.to_i
     end
 
     def sync_player_obj!
@@ -95,12 +114,7 @@ module Maruchi
         diag = [1, 3, 7, 9].include?(@dir8) ? @dir8 : 0
         @player_obj.diagonal_direction = diag
       end
-      if @actor
-        @hp    = @actor.hp
-        @maxhp = @actor.maxhp
-        @mp    = @actor.mp
-        @maxmp = @actor.maxmp
-      end
+      refresh_vitals!
     end
 
     def queue_frame(payload_utf8)
@@ -163,6 +177,7 @@ module Maruchi
     end
 
     def to_snapshot_hash
+      refresh_vitals!
       {
         :id         => @id,
         :name       => @name,
@@ -179,7 +194,10 @@ module Maruchi
         :maxhp      => @maxhp,
         :moving     => @moving,
         :pattern    => @pattern,
-        :step_anime => @step_anime
+        :step_anime => @step_anime,
+        :mp         => @mp,
+        :maxmp      => @maxmp,
+        :down_timer => @down_timer
       }
     end
 
@@ -191,7 +209,8 @@ module Maruchi
   end
 
   class HeadlessServer
-    attr_reader :sessions, :map_id, :spawn_x, :spawn_y, :tick
+    attr_reader :sessions, :map_id, :spawn_x, :spawn_y, :tick, :mode
+    attr_accessor :active_context_session
 
     def initialize(options)
       @host      = options[:host]
@@ -210,6 +229,8 @@ module Maruchi
       @pending_se = []
       @capture_se = false
       @pending_dead_enemies = []
+      @pending_knockbacks = []
+      @active_context_session = nil
     end
 
     def boot_world!
@@ -283,7 +304,6 @@ module Maruchi
 
         step_tick!
         next_tick_at += tick_dt
-        # Catch up without spiral of death if system paused
         if now - next_tick_at > 0.25
           next_tick_at = now + tick_dt
         end
@@ -295,6 +315,7 @@ module Maruchi
     def step_tick!
       @pending_se.clear
       @pending_dead_enemies.clear
+      @pending_knockbacks.clear
 
       accept_new_clients
       @capture_se = true
@@ -303,25 +324,17 @@ module Maruchi
       @tick += 1
       Graphics.update
 
-      # Only advance world simulation when at least one player is connected (saves CPU when idle)
       if !@sessions.empty?
         authed_sessions = @sessions.values.select { |s| s.authed && !s.closed }
         unless authed_sessions.empty?
-          # Drive per-player XAS action/multi-shoot timers and treasure pickups
+          # Step 1: Drive per-player timers, multi-shoots, contact collisions, pickups, down/revive
           authed_sessions.each do |session|
-            with_session_context(session) do
-              po = session.player_obj
-              po.action_update if po.respond_to?(:action_update)
-              if po.respond_to?(:can_force_action?) && po.can_force_action?
-                po.update_force_action
-              end
-              check_session_treasure_pickup!(session)
-            end
+            update_session_tick!(session, authed_sessions)
           end
 
-          # Bind $game_player to first active player during map tick; enemy AI hook overrides per-enemy
-          first_session = authed_sessions.first
-          with_session_context(first_session) do
+          # Step 2: Advance authoritative map/AI/projectile simulation
+          first_alive = authed_sessions.find(&:alive?) || authed_sessions.first
+          with_session_context(first_alive) do
             begin
               $game_system.update
               $game_map.update
@@ -331,6 +344,12 @@ module Maruchi
             end
           end
 
+          # Step 3: Check if any player dropped to 0 HP during map/projectile tick
+          authed_sessions.each do |session|
+            check_session_downed!(session)
+          end
+
+          # Step 4: Collect & broadcast all authoritative combat FX, deaths, knockbacks, SEs
           collect_and_broadcast_fx!(authed_sessions)
 
           if (@tick % @snap_interval) == 0
@@ -360,20 +379,53 @@ module Maruchi
       log("Enemy defeated: ev##{ev.id} (enemy_id=#{enemy.id}, exp=#{exp}, gold=#{gold})")
     end
 
+    def record_player_knockback(session_id, dir, power)
+      return if power.to_i <= 0
+      @pending_knockbacks << [session_id.to_i, dir.to_i, power.to_i]
+    end
+
     def with_session_context(session)
-      prev_player = $game_player
+      prev_player  = $game_player
+      prev_session = @active_context_session
+      @active_context_session = session
       session.sync_player_obj!
       $game_player = session.player_obj
       yield
     ensure
       $game_player = prev_player
+      @active_context_session = prev_session
+    end
+
+    def all_active_player_objs
+      list = []
+      @sessions.each_value do |s|
+        next unless s.alive?
+        s.sync_player_obj!
+        list << s.player_obj
+      end
+      list
+    end
+
+    def session_for_player_obj(po)
+      return nil unless po && po.respond_to?(:maruchi_session_id)
+      @sessions[po.maruchi_session_id]
+    end
+
+    def pvp_hostile?(user_char, target_char)
+      return false unless @mode == "pvp"
+      return false unless user_char.is_a?(Game_Player) && target_char.is_a?(Game_Player)
+      return false if user_char == target_char
+      s1 = session_for_player_obj(user_char)
+      s2 = session_for_player_obj(target_char)
+      return false unless s1 && s2 && s1.alive? && s2.alive?
+      s1.team != s2.team
     end
 
     def nearest_session_to(ex, ey)
       best = nil
       best_d = 999_999
       @sessions.each_value do |s|
-        next if s.closed || !s.authed
+        next unless s.alive?
         d = (s.x - ex).abs + (s.y - ey).abs
         if d < best_d
           best_d = d
@@ -385,6 +437,96 @@ module Maruchi
 
     private
 
+    def update_session_tick!(session, authed_sessions)
+      if session.downed?
+        # Co-op rescue: nearby living teammate accelerates revive 4x (1.25s instead of 5s)
+        speed = 1
+        if @mode != "pvp"
+          ally_near = authed_sessions.any? do |other|
+            other.id != session.id && other.alive? &&
+              ((other.x - session.x).abs + (other.y - session.y).abs) <= 2
+          end
+          speed = 4 if ally_near
+        end
+        session.down_timer = [session.down_timer - speed, 0].max
+        revive_session!(session) if session.down_timer == 0
+        return
+      end
+
+      with_session_context(session) do
+        po = session.player_obj
+        b  = session.actor
+        # Advance invulnerability frames & knockback countdown per player
+        if b
+          b.invunerable_duration -= 1 if b.respond_to?(:invunerable_duration) && b.invunerable_duration.to_i > 0
+          if b.respond_to?(:state_duration) && b.state_duration.is_a?(Hash)
+            b.state_duration.keys.each do |sid|
+              if b.state_duration[sid].to_i > 0
+                b.state_duration[sid] -= 1
+                b.remove_state(sid) if b.state_duration[sid] <= 0
+              end
+            end
+          end
+        end
+        if po.knock_back_duration != nil
+          po.knock_back_duration -= 1
+          po.knock_back_duration = nil if po.knock_back_duration <= 0
+        end
+
+        po.action_update if po.respond_to?(:action_update)
+        if po.respond_to?(:can_force_action?) && po.can_force_action?
+          po.update_force_action
+        end
+
+        check_session_enemy_collision!(session)
+        check_session_treasure_pickup!(session)
+        check_session_downed!(session)
+      end
+    end
+
+    def check_session_enemy_collision!(session)
+      return unless session.alive?
+      return if $game_map.interpreter.running?
+      $game_map.events.each_value do |ev|
+        next if ev.erased
+        next unless ev.respond_to?(:collision_attack) && ev.collision_attack
+        next unless ev.respond_to?(:battler) && ev.battler.is_a?(Game_Enemy)
+        next if ev.battler.dead?
+        if ev.x == session.x && ev.y == session.y
+          session.player_obj.attack_effect(ev)
+        end
+      end
+    end
+
+    def check_session_downed!(session)
+      return if session.closed || !session.authed || session.downed?
+      return unless session.actor && session.actor.hp <= 0
+      session.actor.hp = 0
+      session.down_timer = ClientSession::REVIVE_TICKS
+      session.refresh_vitals!
+      log("Player ##{session.id} ('#{session.name}') DOWNED! Revive in #{ClientSession::REVIVE_TICKS / 60}s")
+      broadcast_frame(Maruchi::Protocol.build_event("PLAYER_DOWN", session.id, session.down_timer))
+    end
+
+    def revive_session!(session)
+      return unless session.actor
+      session.actor.recover_all
+      session.actor.invunerable_duration = 120 if session.actor.respond_to?(:invunerable_duration=)
+      session.actor.defeated = false if session.actor.respond_to?(:defeated=)
+      session.player_obj.knock_back_duration = nil
+      session.down_timer = 0
+      # In PvP respawn at safe spawn; in Co-op revive in-place if passable else safe spawn
+      if @mode == "pvp" || !$game_map.passable?(session.x, session.y)
+        session.x = @spawn_x
+        session.y = @spawn_y
+        session.real_x = @spawn_x * 256
+        session.real_y = @spawn_y * 256
+      end
+      session.sync_player_obj!
+      log("Player ##{session.id} ('#{session.name}') REVIVED at (#{session.x},#{session.y}) hp=#{session.hp}/#{session.maxhp}")
+      broadcast_frame(Maruchi::Protocol.build_event("PLAYER_REVIVE", session.id, session.x, session.y))
+    end
+
     def install_multiplayer_hooks!
       server = self
       $MARUCHI_SERVER = server
@@ -393,6 +535,21 @@ module Maruchi
       unless Game_Map.method_defined?(:id)
         Game_Map.class_eval do
           alias_method :id, :map_id
+        end
+      end
+
+      # Isolate $game_party.members[0] per active session context so all XAS & custom scripts
+      # reading $game_party.members[0] see the active player's independent Game_Actor!
+      Game_Party.class_eval do
+        unless method_defined?(:maruchi_orig_members)
+          alias_method :maruchi_orig_members, :members
+          def members
+            srv = $MARUCHI_SERVER
+            if srv && srv.active_context_session && srv.active_context_session.actor
+              return [srv.active_context_session.actor]
+            end
+            maruchi_orig_members
+          end
         end
       end
 
@@ -408,8 +565,103 @@ module Maruchi
         end
       end
 
-      # Hook Game_Event#update for multi-player enemy aggro & owner-bound projectile context
+      # Hook XAS_ACTION#check_event_trigger_attack so bullets/skills hit ALL connected players + enemies
+      if defined?(XAS_ACTION) && XAS_ACTION.method_defined?(:check_event_trigger_attack)
+        XAS_ACTION.module_eval do
+          unless method_defined?(:maruchi_orig_check_event_trigger_attack)
+            alias_method :maruchi_orig_check_event_trigger_attack, :check_event_trigger_attack
+            def check_event_trigger_attack
+              srv = $MARUCHI_SERVER
+              return maruchi_orig_check_event_trigger_attack unless srv && !srv.sessions.empty?
+              return unless can_impact_target?
+
+              hit_check = false
+              range = @action.attack_range
+              hit = []
+              targets = srv.all_active_player_objs + $game_map.events.values
+              ar = [68,69,70,83,124,125,134,152,153,178,181,204,205,210,211,212,213,214,216,217,218,246,253,277,280,282,299,330,368,396,340,441,461,462,463,469,491,492,493,522,584,594,595,600]
+              judge_fix = ((ar.include?(self.tool_id) && self.direction != 8) ? 1 : 0)
+
+              for event in targets
+                next if event == self || @action.hit_events.include?(event) || event.erased
+
+                body_size      = event.body_size
+                event_center_x = event.x
+                event_center_y = event.y - body_size
+
+                if @action.short_range
+                  owner = @action.user || $game_player
+                  dx = event_center_x - owner.x
+                  dy = event_center_y - owner.y
+                else
+                  dx = event_center_x - self.x
+                  dy = event_center_y - self.y + judge_fix
+                end
+                dx = (dx >= 0 ? [dx - body_size, 0].max : [dx + body_size, 0].min)
+                dy = (dy >= 0 ? [dy - body_size, 0].max : [dy + body_size, 0].min)
+                hit.push(event) if in_range?(dx, dy, event, range)
+              end
+
+              for event in hit
+                victim_sess = srv.session_for_player_obj(event)
+                if victim_sess
+                  srv.with_session_context(victim_sess) do
+                    hit_check = true if event.action_effect(self, self.action.attack_id)
+                  end
+                else
+                  hit_check = true if event.action_effect(self, self.action.attack_id)
+                  hit_check = true if event.action_effect_page(self, self.action.attack_id)
+                end
+                @action.hit_events.push(event) unless @action.multi_hit
+              end
+              $game_temp.active_token = self if hit_check
+            end
+          end
+        end
+      end
+
+      # Hook XRXS_BattlerAttachment#action_can_hit_target? for PvP hostile player-vs-player hits
+      if defined?(XRXS_BattlerAttachment) && XRXS_BattlerAttachment.method_defined?(:action_can_hit_target?)
+        XRXS_BattlerAttachment.module_eval do
+          unless method_defined?(:maruchi_orig_action_can_hit_target?)
+            alias_method :maruchi_orig_action_can_hit_target?, :action_can_hit_target?
+            def action_can_hit_target?(bullet, user, skill, tar_invu)
+              srv = $MARUCHI_SERVER
+              if srv && bullet && bullet.action && srv.pvp_hostile?(user, self)
+                prev_all = bullet.action.all_damage
+                bullet.action.all_damage = true
+                begin
+                  return maruchi_orig_action_can_hit_target?(bullet, user, skill, tar_invu)
+                ensure
+                  bullet.action.all_damage = prev_all
+                end
+              end
+              maruchi_orig_action_can_hit_target?(bullet, user, skill, tar_invu)
+            end
+          end
+        end
+      end
+
+      # Hook Game_Event#check_event_trigger_touch so enemies stepping into ANY player deal contact damage
       Game_Event.class_eval do
+        if method_defined?(:check_event_trigger_touch) && !method_defined?(:maruchi_orig_ev_touch)
+          alias_method :maruchi_orig_ev_touch, :check_event_trigger_touch
+          def check_event_trigger_touch(x, y)
+            srv = $MARUCHI_SERVER
+            if srv && !srv.sessions.empty? && self.collision_attack && self.battler != nil && !self.battler.dead?
+              return if $game_map.interpreter.running?
+              srv.sessions.each_value do |s|
+                next unless s.alive?
+                if x == s.x && y == s.y
+                  srv.with_session_context(s) { s.player_obj.attack_effect(self) }
+                end
+              end
+              return
+            end
+            maruchi_orig_ev_touch(x, y)
+          end
+        end
+
         unless method_defined?(:maruchi_orig_update)
           alias_method :maruchi_orig_update, :update
           def update
@@ -422,14 +674,11 @@ module Maruchi
                   return
                 end
               elsif is_a?(Token_Bullet) && @action && @action.user.is_a?(Game_Player)
-                prev = $game_player
-                $game_player = @action.user
-                begin
-                  maruchi_orig_update
-                ensure
-                  $game_player = prev
+                owner_sess = srv.session_for_player_obj(@action.user)
+                if owner_sess
+                  srv.with_session_context(owner_sess) { maruchi_orig_update }
+                  return
                 end
-                return
               end
             end
             maruchi_orig_update
@@ -437,8 +686,21 @@ module Maruchi
         end
       end
 
-      # Hook Game_Character#execute_enemy_defeated_process to broadcast authoritative death & rewards
+      # Hook Game_Character#blow to forward player knockbacks to clients & prevent server-side Scene_Gameover
       Game_Character.class_eval do
+        if method_defined?(:blow) && !method_defined?(:maruchi_orig_blow)
+          alias_method :maruchi_orig_blow, :blow
+          def blow(d, power = 1)
+            srv = $MARUCHI_SERVER
+            if srv && respond_to?(:maruchi_session_id) && maruchi_session_id
+              srv.record_player_knockback(maruchi_session_id, d, power)
+              @knock_back_duration = XAS_BA::DEFAULT_KNOCK_BACK_DURATION if defined?(XAS_BA)
+              return
+            end
+            maruchi_orig_blow(d, power)
+          end
+        end
+
         if method_defined?(:execute_enemy_defeated_process) && !method_defined?(:maruchi_orig_enemy_defeated)
           alias_method :maruchi_orig_enemy_defeated, :execute_enemy_defeated_process
           def execute_enemy_defeated_process
@@ -450,9 +712,18 @@ module Maruchi
             end
           end
         end
+
+        if method_defined?(:execute_actor_defeated_process) && !method_defined?(:maruchi_orig_actor_defeated)
+          alias_method :maruchi_orig_actor_defeated, :execute_actor_defeated_process
+          def execute_actor_defeated_process
+            # Handled authoritatively via down_timer / revive_session!
+            return if $MARUCHI_SERVER
+            maruchi_orig_actor_defeated
+          end
+        end
       end
 
-      # Ensure make_treasure works reliably on headless server (guard page.list & $game_map.id)
+      # Guard make_treasure on headless server
       if defined?(XAS_BA_ItemDrop) && XAS_BA_ItemDrop.method_defined?(:make_treasure)
         XAS_BA_ItemDrop.module_eval do
           unless method_defined?(:maruchi_orig_make_treasure)
@@ -485,7 +756,6 @@ module Maruchi
       end
     end
 
-    # Authoritative treasure pickup check for every connected player
     def check_session_treasure_pickup!(session)
       $game_map.events_xy(session.x, session.y).each do |ev|
         next if ev.erased
@@ -518,16 +788,18 @@ module Maruchi
       elsif note =~ /<Drop Gold = (\d+)>/
         $game_party.gain_gold($1.to_i)
       end
+      session.refresh_vitals!
     end
 
-    # Capture & broadcast all authoritative animations, damage pops, deaths, and SEs generated this tick
     def collect_and_broadcast_fx!(authed_sessions)
-      # 1. Enemy deaths
       @pending_dead_enemies.each do |ev_id, enemy_id, exp, gold|
         broadcast_frame(Maruchi::Protocol.build_event("ENEMY_DEAD", ev_id, enemy_id, exp, gold))
       end
 
-      # 2. Player animations & damage pops
+      @pending_knockbacks.each do |pid, dir, power|
+        broadcast_frame(Maruchi::Protocol.build_event("KNOCKBACK", pid, dir, power))
+      end
+
       authed_sessions.each do |s|
         po = s.player_obj
         if po.animation_id.to_i > 0
@@ -548,7 +820,6 @@ module Maruchi
         end
       end
 
-      # 3. Map event (enemy + token) animations & damage pops
       $game_map.events.each_value do |ev|
         t_type = ev.is_a?(Token_Event) ? "T" : "E"
         if ev.animation_id.to_i > 0
@@ -569,7 +840,6 @@ module Maruchi
         end
       end
 
-      # 4. Combat/action SEs
       @pending_se.each do |se_name, vol, pitch|
         broadcast_frame(Maruchi::Protocol.build_event("FX_SE", se_name, vol, pitch))
       end
@@ -646,7 +916,7 @@ module Maruchi
         session.name = name unless name.empty?
         session.set_actor!(actor_id)
         session.authed = true
-        log("Client ##{session.id} HELLO name='#{session.name}' actor=#{session.actor_id} (#{session.actor ? session.actor.name : '?'})")
+        log("Client ##{session.id} HELLO name='#{session.name}' actor=#{session.actor_id} (#{session.actor ? session.actor.name : '?'}) HP=#{session.hp}/#{session.maxhp} MP=#{session.mp}/#{session.maxmp}")
         session.queue_frame(
           Maruchi::Protocol.build_welcome(session.id, @map_id, @spawn_x, @spawn_y, @mode, @tick_rate)
         )
@@ -654,12 +924,11 @@ module Maruchi
           Maruchi::Protocol.build_event("JOIN", session.id, session.name),
           exclude_id: session.id
         )
-        # Immediately send an initial snapshot so the new client sees everyone right away
         send_snapshot_to(session)
 
       when "PSTATE"
-        # PSTATE seq x y real_x real_y dir moving char_name char_index actor_id dir8 btn_mask [pattern step_anime]
         return if fields.length < 13
+        return if session.downed?
         nx = fields[2].to_i
         ny = fields[3].to_i
         nrx = fields[4].to_i
@@ -671,7 +940,6 @@ module Maruchi
         aid   = fields[10].to_i
         ndir8 = fields[11].to_i
 
-        # Basic bounds validation against authoritative map dimensions
         if nx >= 0 && nx < $game_map.width && ny >= 0 && ny < $game_map.height
           session.x = nx
           session.y = ny
@@ -688,15 +956,12 @@ module Maruchi
           session.char_name = cname unless cname.empty?
           session.char_index = cidx
         end
-        if fields.length > 13
-          session.pattern = fields[13].to_i
-        end
-        if fields.length > 14
-          session.step_anime = (fields[14].to_i != 0)
-        end
+        session.pattern = fields[13].to_i if fields.length > 13
+        session.step_anime = (fields[14].to_i != 0) if fields.length > 14
         session.sync_player_obj!
 
       when "ACTION"
+        return unless session.alive?
         kind = Maruchi::Protocol.unesc(fields[1])
         action_id = fields[2].to_i
         return if action_id <= 0
@@ -707,12 +972,8 @@ module Maruchi
         if kind == "SHOOT" && action_id > 0 && session.player_obj.respond_to?(:shoot)
           with_session_context(session) do
             begin
-              # Step 4.1: Keep MP topped up on server until Step 4.2 introduces full authoritative MP sync
-              if session.actor && $data_skills[action_id]
-                need_mp = $data_skills[action_id].mp_cost.to_i + 2
-                session.actor.mp = need_mp if session.actor.mp < need_mp
-              end
               $game_player.shoot(action_id)
+              session.refresh_vitals!
             rescue StandardError => e
               log("WARN shoot error for player ##{session.id} (action=#{action_id}): #{e.class}: #{e.message}")
             end

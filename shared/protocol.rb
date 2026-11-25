@@ -5,7 +5,7 @@
 #==============================================================================
 module Maruchi
   module Protocol
-    VERSION = 2
+    VERSION = 3
 
     # Escapes delimiters (\t, \n, \r, ;, ,, %) so arbitrary UTF-8 strings (Chinese names, filenames) are safe
     def self.esc(str)
@@ -92,7 +92,7 @@ module Maruchi
       encoded.join("\t")
     end
 
-    # players: array of hashes with :id,:name,:actor_id,:team,:x,:y,:real_x,:real_y,:dir,:char_name,:char_index,:hp,:maxhp,:moving,:pattern,:step_anime
+    # players: array of hashes with :id,:name,:actor_id,:team,:x,:y,:real_x,:real_y,:dir,:char_name,:char_index,:hp,:maxhp,:moving,:pattern,:step_anime,:mp,:maxmp,:down_timer
     # enemies: array of hashes with :id,:x,:y,:real_x,:real_y,:dir,:hp,:maxhp,:erased,:opacity,:collapse_dur,:defeated
     # tokens:  array of hashes with :id,:kind,:x,:y,:real_x,:real_y,:dir,:char_name,:char_index,:pattern,:opacity,:blend_type,:angle,:zoom_x,:zoom_y,:icon_name,:jump_y
     def self.build_snapshot(server_tick, map_id, players, enemies, tokens = [])
@@ -113,7 +113,10 @@ module Maruchi
           p[:maxhp].to_i,
           p[:moving] ? 1 : 0,
           (p[:pattern] || 1).to_i,
-          p[:step_anime] ? 1 : 0
+          p[:step_anime] ? 1 : 0,
+          p[:mp].to_i,
+          p[:maxmp].to_i,
+          p[:down_timer].to_i
         ].join(",")
       end.join(";")
 
@@ -182,7 +185,10 @@ module Maruchi
           :maxhp      => f[12].to_i,
           :moving     => (f[13].to_i != 0),
           :pattern    => (f.length > 14 ? f[14].to_i : 1),
-          :step_anime => (f.length > 15 ? (f[15].to_i != 0) : false)
+          :step_anime => (f.length > 15 ? (f[15].to_i != 0) : false),
+          :mp         => (f.length > 16 ? f[16].to_i : 0),
+          :maxmp      => (f.length > 17 ? f[17].to_i : 0),
+          :down_timer => (f.length > 18 ? f[18].to_i : 0)
         })
       end
       result

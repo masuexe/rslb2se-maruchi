@@ -1,10 +1,10 @@
 #==============================================================================
-# Maruchi Co-op Client (Step 4.1: Projectiles, Actions, FX, Enemy Death & Drops)
+# Maruchi Co-op / PvP Client (Step 4.2: Multi-player Hits, HP/MP, Revive & HUD)
 # Strictly Ruby 1.8.1 / RGSS2 compatible
 # - Press F7 on Title or Map to connect/join the headless server (or AUTO_JOIN=1)
-# - Renders remote players with smooth interpolation, action poses & name tags
+# - Renders remote players with smooth interpolation, action poses, name & HP bars
 # - Renders server-authoritative projectiles (Token_Bullet) & item drops (treasure)
-# - Syncs authoritative combat animations, damage popups, SEs, enemy collapse & drops
+# - Syncs authoritative HP/MP, combat FX, knockback, down/revive & Party HUD
 #==============================================================================
 if Maruchi::Config::MODS[:coop_client]
 
@@ -40,7 +40,8 @@ if Maruchi::Config::MODS[:coop_client]
   # Remote player entity rendered by Sprite_Character on Spriteset_Map
   #----------------------------------------------------------------------------
   class Game_RemotePlayer < Game_Character
-    attr_accessor :player_id, :player_name, :actor_id, :team, :hp, :maxhp
+    attr_accessor :player_id, :player_name, :actor_id, :team
+    attr_accessor :hp, :maxhp, :mp, :maxmp, :down_timer
     attr_accessor :target_real_x, :target_real_y, :remote_moving
     attr_accessor :remote_pattern, :remote_step_anime
     attr_accessor :erased, :can_update, :throw_active, :battler
@@ -53,6 +54,9 @@ if Maruchi::Config::MODS[:coop_client]
       @team = 0
       @hp = 100
       @maxhp = 100
+      @mp = 0
+      @maxmp = 0
+      @down_timer = 0
       @erased = false
       @can_update = true
       @throw_active = false
@@ -69,14 +73,24 @@ if Maruchi::Config::MODS[:coop_client]
       @initialized_pos = false
     end
 
+    def downed?
+      @down_timer > 0
+    end
+
     def apply_snapshot(p)
       @player_name = p[:name] if p[:name] && !p[:name].empty?
       @actor_id    = p[:actor_id]
       @team        = p[:team]
       @hp          = p[:hp]
-      @maxhp       = p[:maxhp]
+      @maxhp       = [p[:maxhp].to_i, 1].max
+      @mp          = p[:mp].to_i
+      @maxmp       = p[:maxmp].to_i
+      @down_timer  = p[:down_timer].to_i
       @battler.hp    = @hp
       @battler.maxhp = @maxhp
+      @battler.mp    = @mp
+      @battler.maxmp = @maxmp
+      @opacity       = (@down_timer > 0) ? 128 : 255
       @direction   = p[:dir] if [2, 4, 6, 8].include?(p[:dir])
       @x           = p[:x]
       @y           = p[:y]
@@ -101,7 +115,6 @@ if Maruchi::Config::MODS[:coop_client]
     end
 
     def update
-      # Smoothly interpolate toward latest authoritative real_x/real_y
       dx = @target_real_x - @real_x
       dy = @target_real_y - @real_y
       if dx.abs > 1024 || dy.abs > 1024
@@ -114,8 +127,11 @@ if Maruchi::Config::MODS[:coop_client]
         @real_y = @target_real_y if dy.abs < 4
       end
 
-      # Sync action pose frame directly when step_anime (weapon swing / cast) is active
-      if @remote_step_anime
+      if @down_timer > 0
+        @step_anime = false
+        @pattern = @original_pattern
+        @anime_count = 0
+      elsif @remote_step_anime
         @step_anime = true
         @pattern = @remote_pattern
         @anime_count = 0
@@ -136,7 +152,6 @@ if Maruchi::Config::MODS[:coop_client]
 
   #----------------------------------------------------------------------------
   # Authoritative server Token_Event proxy (Projectiles & Dropped Treasures)
-  # Rendered natively by Sprite_Character on Spriteset_Map
   #----------------------------------------------------------------------------
   class Game_RemoteToken < Game_Character
     attr_accessor :token_id, :token_kind
@@ -214,37 +229,61 @@ if Maruchi::Config::MODS[:coop_client]
   end
 
   #----------------------------------------------------------------------------
-  # Overhead Name Tag Sprite for Remote Players
+  # Overhead Name Tag + Mini HP Bar / Down Timer for Remote Players
   #----------------------------------------------------------------------------
   class Sprite_RemoteNameTag < Sprite
     def initialize(viewport, character)
       super(viewport)
       @character = character
-      @last_text = nil
+      @last_key = nil
       self.z = 210
-      self.bitmap = Bitmap.new(128, 22)
-      self.bitmap.font.size = 14
+      self.bitmap = Bitmap.new(128, 30)
+      self.bitmap.font.size = 13
       self.bitmap.font.bold = true
       self.ox = 64
-      self.oy = 56
-      refresh_text
+      self.oy = 62
+      refresh_tag
       update
     end
 
-    def refresh_text
-      text = @character.player_name.to_s
-      return if text == @last_text
-      @last_text = text
+    def refresh_tag
+      down_sec = (@character.down_timer.to_i + 59) / 60
+      key = [@character.player_name.to_s, @character.hp.to_i, @character.maxhp.to_i, down_sec, Maruchi::Coop.server_mode]
+      return if key == @last_key
+      @last_key = key
+
       self.bitmap.clear
-      self.bitmap.font.color = Color.new(0, 0, 0, 200)
-      self.bitmap.draw_text(1, 1, 128, 20, text, 1)
-      self.bitmap.font.color = Color.new(120, 240, 255, 255)
-      self.bitmap.draw_text(0, 0, 128, 20, text, 1)
+      label = down_sec > 0 ? "#{@character.player_name} [DOWN #{down_sec}s]" : @character.player_name.to_s
+      self.bitmap.font.color = Color.new(0, 0, 0, 210)
+      self.bitmap.draw_text(1, 1, 128, 18, label, 1)
+      if down_sec > 0
+        self.bitmap.font.color = Color.new(255, 160, 80, 255)
+      elsif Maruchi::Coop.server_mode == "pvp"
+        self.bitmap.font.color = Color.new(255, 110, 110, 255)
+      else
+        self.bitmap.font.color = Color.new(120, 240, 255, 255)
+      end
+      self.bitmap.draw_text(0, 0, 128, 18, label, 1)
+
+      # Mini HP bar (48x5) centered below name
+      bx = 40
+      by = 20
+      bw = 48
+      bh = 5
+      mhp = [@character.maxhp.to_i, 1].max
+      hp  = [[@character.hp.to_i, 0].max, mhp].min
+      fill_w = ((hp * (bw - 2)) / mhp).to_i
+      self.bitmap.fill_rect(bx, by, bw, bh, Color.new(0, 0, 0, 200))
+      self.bitmap.fill_rect(bx + 1, by + 1, bw - 2, bh - 2, Color.new(110, 20, 20, 220))
+      if fill_w > 0
+        bar_col = (hp * 3 < mhp) ? Color.new(255, 90, 60) : Color.new(80, 235, 120)
+        self.bitmap.fill_rect(bx + 1, by + 1, fill_w, bh - 2, bar_col)
+      end
     end
 
     def update
       super
-      refresh_text
+      refresh_tag
       self.x = @character.screen_x
       self.y = @character.screen_y
       self.visible = !@character.transparent
@@ -257,29 +296,81 @@ if Maruchi::Config::MODS[:coop_client]
   end
 
   #----------------------------------------------------------------------------
-  # Tiny Top-Right Multiplayer Status HUD
+  # Top-Right Multiplayer Status & Party HP/MP HUD
   #----------------------------------------------------------------------------
   class Sprite_MaruchiHud < Sprite
+    HUD_W = 196
+    ROW_H = 22
+    MAX_ROWS = 6
+
     def initialize(viewport)
       super(viewport)
       self.z = 250
-      self.x = 544 - 236
+      self.x = 544 - HUD_W - 4
       self.y = 4
-      self.bitmap = Bitmap.new(232, 24)
-      self.bitmap.font.size = 13
-      @last_str = nil
+      self.bitmap = Bitmap.new(HUD_W, 24 + ROW_H * MAX_ROWS)
+      @last_sig = nil
       update
     end
 
     def update
       super
-      str = Maruchi::Coop.hud_text
-      return if str == @last_str
-      @last_str = str
+      header = Maruchi::Coop.hud_text
+      rows   = Maruchi::Coop.party_hud_rows
+      sig = [header, rows]
+      return if sig == @last_sig
+      @last_sig = sig
+
       self.bitmap.clear
-      self.bitmap.fill_rect(0, 0, 232, 22, Color.new(0, 0, 0, 140))
+      # Header bar
+      self.bitmap.fill_rect(0, 0, HUD_W, 20, Color.new(0, 0, 0, 155))
+      self.bitmap.font.size = 12
+      self.bitmap.font.bold = true
       self.bitmap.font.color = Maruchi::Coop.connected? ? Color.new(120, 255, 160) : Color.new(255, 220, 120)
-      self.bitmap.draw_text(6, 1, 220, 20, str, 2)
+      self.bitmap.draw_text(4, 1, HUD_W - 8, 18, header, 2)
+
+      return unless Maruchi::Coop.connected?
+
+      # Party member rows (self + teammates)
+      y = 22
+      rows[0, MAX_ROWS].each do |r|
+        self.bitmap.fill_rect(0, y, HUD_W, ROW_H - 2, Color.new(0, 0, 0, 130))
+        self.bitmap.font.size = 11
+        self.bitmap.font.bold = r[:is_self]
+        if r[:down_sec] > 0
+          self.bitmap.font.color = Color.new(255, 150, 90)
+          title = "#{r[:name]} DOWN #{r[:down_sec]}s"
+        else
+          self.bitmap.font.color = r[:is_self] ? Color.new(255, 240, 140) : Color.new(160, 235, 255)
+          title = r[:name]
+        end
+        self.bitmap.draw_text(4, y, 92, 13, title, 0)
+
+        # Compact HP text right-aligned
+        self.bitmap.font.bold = false
+        self.bitmap.font.color = Color.new(235, 235, 235)
+        self.bitmap.draw_text(96, y, HUD_W - 100, 13, "#{r[:hp]}/#{r[:maxhp]}", 2)
+
+        # HP bar (left 124px) & MP bar (right 60px)
+        bar_y = y + 14
+        hp_w = 122
+        mhp = [r[:maxhp], 1].max
+        hp_fill = [[(r[:hp] * hp_w) / mhp, 0].max, hp_w].min
+        self.bitmap.fill_rect(4, bar_y, hp_w, 4, Color.new(90, 20, 20, 220))
+        if hp_fill > 0
+          col = (r[:hp] * 3 < mhp) ? Color.new(255, 85, 65) : Color.new(80, 230, 120)
+          self.bitmap.fill_rect(4, bar_y, hp_fill, 4, col)
+        end
+
+        mp_x = 130
+        mp_w = HUD_W - mp_x - 4
+        mmp = [r[:maxmp], 1].max
+        mp_fill = r[:maxmp] > 0 ? [[(r[:mp] * mp_w) / mmp, 0].max, mp_w].min : 0
+        self.bitmap.fill_rect(mp_x, bar_y, mp_w, 4, Color.new(20, 35, 95, 220))
+        self.bitmap.fill_rect(mp_x, bar_y, mp_fill, 4, Color.new(95, 185, 255)) if mp_fill > 0
+
+        y += ROW_H
+      end
     end
 
     def dispose
@@ -289,7 +380,7 @@ if Maruchi::Config::MODS[:coop_client]
   end
 
   #----------------------------------------------------------------------------
-  # Co-op Client Controller
+  # Co-op / PvP Client Controller
   #----------------------------------------------------------------------------
   module Maruchi
     module Coop
@@ -297,6 +388,11 @@ if Maruchi::Config::MODS[:coop_client]
       @hello_sent = false
       @welcomed = false
       @my_id = nil
+      @my_hp = 100
+      @my_maxhp = 100
+      @my_mp = 0
+      @my_maxmp = 0
+      @my_down_timer = 0
       @server_map_id = nil
       @server_mode = "coop"
       @remote_players = {}
@@ -312,6 +408,8 @@ if Maruchi::Config::MODS[:coop_client]
       def self.active?;         @active;         end
       def self.connected?;      @welcomed && Maruchi::Net.connected?; end
       def self.my_id;           @my_id;          end
+      def self.server_mode;     @server_mode;    end
+      def self.my_downed?;      @my_down_timer > 0; end
       def self.remote_players;  @remote_players; end
       def self.remote_tokens;   @remote_tokens;  end
 
@@ -319,12 +417,42 @@ if Maruchi::Config::MODS[:coop_client]
         if connected?
           cnt = @remote_players.size + 1
           ping_str = @rtt_ms ? " #{@rtt_ms}ms" : ""
-          return "COOP P##{@my_id} (#{cnt}P)#{ping_str}"
+          mode_tag = (@server_mode == "pvp") ? "PVP" : "COOP"
+          return "#{mode_tag} P##{@my_id} (#{cnt}P)#{ping_str}"
         elsif @active && Maruchi::Net.connecting?
           return "COOP Connecting..."
         else
           return @status_note
         end
+      end
+
+      def self.party_hud_rows
+        return [] unless connected?
+        rows = []
+        rows.push({
+          :id       => @my_id.to_i,
+          :name     => Maruchi::Config::PLAYER_NAME.to_s,
+          :hp       => @my_hp.to_i,
+          :maxhp    => [@my_maxhp.to_i, 1].max,
+          :mp       => @my_mp.to_i,
+          :maxmp    => @my_maxmp.to_i,
+          :down_sec => (@my_down_timer.to_i + 59) / 60,
+          :is_self  => true
+        })
+        @remote_players.keys.sort.each do |pid|
+          rp = @remote_players[pid]
+          rows.push({
+            :id       => pid,
+            :name     => rp.player_name.to_s,
+            :hp       => rp.hp.to_i,
+            :maxhp    => [rp.maxhp.to_i, 1].max,
+            :mp       => rp.mp.to_i,
+            :maxmp    => rp.maxmp.to_i,
+            :down_sec => (rp.down_timer.to_i + 59) / 60,
+            :is_self  => false
+          })
+        end
+        rows
       end
 
       def self.connect_and_join(host = nil, port = nil)
@@ -339,6 +467,7 @@ if Maruchi::Config::MODS[:coop_client]
         @hello_sent = false
         @welcomed = false
         @my_id = nil
+        @my_down_timer = 0
         @remote_players.clear
         @remote_tokens.clear
         @enemy_targets.clear
@@ -353,6 +482,7 @@ if Maruchi::Config::MODS[:coop_client]
         @hello_sent = false
         @welcomed = false
         @my_id = nil
+        @my_down_timer = 0
         @remote_players.clear
         @remote_tokens.clear
         @enemy_targets.clear
@@ -360,7 +490,6 @@ if Maruchi::Config::MODS[:coop_client]
       end
 
       def self.ensure_map_scene_for_join(map_id, sx, sy)
-        # Ensure we have a valid party actor (Map #161 intro starts with empty party)
         if $game_party && $game_party.members.empty?
           aid = Maruchi::Config::ACTOR_ID
           aid = 1 unless $data_actors && $data_actors[aid]
@@ -383,7 +512,7 @@ if Maruchi::Config::MODS[:coop_client]
             $game_player.moveto(sx, sy)
             $game_player.refresh
           end
-          Maruchi::Log.info("Entered live Coop Map ##{map_id} at (#{sx},#{sy}), actor=#{$game_party.members[0] ? $game_party.members[0].name : 'none'}")
+          Maruchi::Log.info("Entered live #{@server_mode.upcase} Map ##{map_id} at (#{sx},#{sy}), actor=#{$game_party.members[0] ? $game_party.members[0].name : 'none'}")
         end
       end
 
@@ -416,15 +545,18 @@ if Maruchi::Config::MODS[:coop_client]
           Maruchi::Log.info("Sent HELLO (name=#{Maruchi::Config::PLAYER_NAME}, actor=#{aid})")
         end
 
-        # Drain inbound frames
         Maruchi::Net.poll_all(128).each do |payload|
           handle_message(payload)
         end
 
-        # Smooth interpolation for remote players, tokens, and enemies
         @remote_players.each_value { |rp| rp.update }
         @remote_tokens.each_value  { |tk| tk.update }
         update_enemy_interpolation if connected? && $scene.is_a?(Scene_Map) && $game_map
+
+        # Apply downed opacity to local player
+        if connected? && $game_player
+          $game_player.opacity = (@my_down_timer > 0) ? 128 : 255
+        end
 
         # Send local player state at 30Hz (every 2 frames) while on Scene_Map
         if connected? && $scene.is_a?(Scene_Map) && $game_player && $game_map
@@ -486,7 +618,6 @@ if Maruchi::Config::MODS[:coop_client]
 
         when "SNAP"
           return unless @welcomed && @my_id
-          # SNAP server_tick map_id players_blob enemies_blob [tokens_blob]
           snap_map = f[2].to_i
           players  = Maruchi::Protocol.parse_snapshot_players(f[3])
           enemies  = Maruchi::Protocol.parse_snapshot_enemies(f[4])
@@ -495,7 +626,10 @@ if Maruchi::Config::MODS[:coop_client]
           seen_ids = {}
           players.each do |p|
             pid = p[:id]
-            next if pid == @my_id
+            if pid == @my_id
+              apply_local_player_snapshot(p)
+              next
+            end
             seen_ids[pid] = true
             rp = @remote_players[pid]
             if rp.nil?
@@ -525,6 +659,23 @@ if Maruchi::Config::MODS[:coop_client]
           now_ms  = (Time.now.to_f * 1000.0).to_i
           rtt = now_ms - sent_ms
           @rtt_ms = rtt if rtt >= 0 && rtt < 10000
+        end
+      end
+
+      def self.apply_local_player_snapshot(p)
+        @my_hp         = p[:hp].to_i
+        @my_maxhp      = [p[:maxhp].to_i, 1].max
+        @my_mp         = p[:mp].to_i
+        @my_maxmp      = p[:maxmp].to_i
+        @my_down_timer = p[:down_timer].to_i
+
+        # Keep native XAS HUD & actor HP/MP synced to server authority
+        if $game_party && $game_party.members[0]
+          actor = $game_party.members[0]
+          # Keep local hp >= 1 while downed so native Sprite_Character does not trigger Scene_Gameover
+          display_hp = (@my_down_timer > 0) ? 0 : @my_hp
+          actor.hp = display_hp if actor.hp != display_hp
+          actor.mp = @my_mp if actor.mp != @my_mp
         end
       end
 
@@ -577,6 +728,59 @@ if Maruchi::Config::MODS[:coop_client]
           rescue Exception
           end
 
+        when "KNOCKBACK"
+          pid   = f[2].to_i
+          dir   = f[3].to_i
+          power = f[4].to_i
+          if pid == @my_id && $game_player && $game_player.respond_to?(:blow)
+            $game_player.blow(dir, power)
+          end
+
+        when "PLAYER_DOWN"
+          pid = f[2].to_i
+          timer = f[3].to_i
+          Sound.play_actor_collapse rescue nil
+          if pid == @my_id
+            @my_down_timer = timer > 0 ? timer : 300
+            if $game_player && $game_player.battler
+              $game_player.battler.damage = "DOWN!"
+              $game_player.battler.damage_pop = true
+            end
+          elsif @remote_players[pid]
+            rp = @remote_players[pid]
+            rp.down_timer = timer > 0 ? timer : 300
+            if rp.battler
+              rp.battler.damage = "DOWN!"
+              rp.battler.damage_pop = true
+            end
+          end
+
+        when "PLAYER_REVIVE"
+          pid = f[2].to_i
+          rx  = f[3].to_i
+          ry  = f[4].to_i
+          Sound.play_recovery rescue nil
+          if pid == @my_id && $game_player
+            @my_down_timer = 0
+            $game_player.opacity = 255
+            if $game_party && $game_party.members[0]
+              $game_party.members[0].recover_all
+              $game_player.battler.damage = "REVIVED!"
+              $game_player.battler.damage_pop = true
+            end
+            if $game_player.x != rx || $game_player.y != ry
+              $game_player.moveto(rx, ry)
+            end
+          elsif @remote_players[pid]
+            rp = @remote_players[pid]
+            rp.down_timer = 0
+            rp.opacity = 255
+            if rp.battler
+              rp.battler.damage = "REVIVED!"
+              rp.battler.damage_pop = true
+            end
+          end
+
         when "ENEMY_DEAD"
           ev_id    = f[2].to_i
           enemy_id = f[3].to_i
@@ -598,7 +802,6 @@ if Maruchi::Config::MODS[:coop_client]
       def self.handle_enemy_dead(ev_id, enemy_id, exp, gold)
         Sound.play_enemy_collapse rescue nil
 
-        # Trigger local collapse visual + EXP/Gold popup on the enemy sprite
         if $game_map && $game_map.events[ev_id]
           ev = $game_map.events[ev_id]
           if ev.respond_to?(:battler) && ev.battler
@@ -615,7 +818,6 @@ if Maruchi::Config::MODS[:coop_client]
           end
         end
 
-        # Grant authoritative EXP, Gold, and kill counters to local party
         if $game_variables
           $game_variables[6] = $game_variables[6].to_i + 1
           $game_variables[39] = $game_variables[39].to_i + 1
@@ -691,7 +893,6 @@ if Maruchi::Config::MODS[:coop_client]
           ev.instance_variable_set(:@y, e[:y])
           ev.instance_variable_set(:@direction, e[:dir]) if [2, 4, 6, 8].include?(e[:dir])
 
-          # Record interpolation target (snap if first time or large teleport)
           prev = @enemy_targets[e[:id]]
           if prev.nil? || (e[:real_x] - ev.real_x).abs > 1024 || (e[:real_y] - ev.real_y).abs > 1024
             ev.instance_variable_set(:@real_x, e[:real_x])
@@ -789,7 +990,7 @@ if Maruchi::Config::MODS[:coop_client]
   end
 
   #----------------------------------------------------------------------------
-  # Hook Sprite_Character: Protect enemy HP meter plugin (180) from RemotePlayer
+  # Hook Sprite_Character: Protect enemy HP meter plugin (180) from proxies
   #----------------------------------------------------------------------------
   class Sprite_Character < Sprite_Base
     if method_defined?(:update_battler_meter)
@@ -898,8 +1099,7 @@ if Maruchi::Config::MODS[:coop_client]
   end
 
   #----------------------------------------------------------------------------
-  # Hook Game_Event: Suppress local autonomous movement, hit math & defeat math
-  # when connected to authoritative server
+  # Hook Game_Event: Suppress local AI, enemy hits, contact hits & defeat math
   #----------------------------------------------------------------------------
   class Game_Event
     alias maruchi_coop_update_self_movement update_self_movement
@@ -931,15 +1131,54 @@ if Maruchi::Config::MODS[:coop_client]
 
   #----------------------------------------------------------------------------
   # Hook Game_Player:
-  # - Forward top-level XAS weapon shots (shoot) to authoritative server
-  # - Suppress duplicate local Token_Bullet spawns (server streams all tokens)
-  # - Delegate treasure pickup to authoritative server
+  # - Suppress local contact/projectile self-damage & Scene_Gameover
+  # - Lock movement & commands while downed awaiting revive
+  # - Forward top-level XAS weapon shots to server & suppress duplicate tokens
   #----------------------------------------------------------------------------
   class Game_Player
+    alias maruchi_coop_movable? movable?
+    def movable?
+      return false if Maruchi::Coop.connected? && Maruchi::Coop.my_downed?
+      maruchi_coop_movable?
+    end
+
+    if method_defined?(:can_use_command?)
+      alias maruchi_coop_can_use_command? can_use_command?
+      def can_use_command?
+        return false if Maruchi::Coop.connected? && Maruchi::Coop.my_downed?
+        maruchi_coop_can_use_command?
+      end
+    end
+
+    if method_defined?(:attack_effect)
+      alias maruchi_coop_player_attack_effect attack_effect
+      def attack_effect(attacker)
+        return false if Maruchi::Coop.connected?
+        maruchi_coop_player_attack_effect(attacker)
+      end
+    end
+
+    if method_defined?(:action_effect)
+      alias maruchi_coop_player_action_effect action_effect
+      def action_effect(bullet, action_id)
+        return false if Maruchi::Coop.connected?
+        maruchi_coop_player_action_effect(bullet, action_id)
+      end
+    end
+
+    if method_defined?(:execute_actor_defeated_process)
+      alias maruchi_coop_actor_defeated execute_actor_defeated_process
+      def execute_actor_defeated_process
+        return if Maruchi::Coop.connected?
+        maruchi_coop_actor_defeated
+      end
+    end
+
     if method_defined?(:shoot)
       alias maruchi_coop_shoot shoot
       def shoot(action_id)
         if Maruchi::Coop.connected? && action_id.to_i > 0
+          return if Maruchi::Coop.my_downed?
           @maruchi_top_shoot = (@force_action_times.to_i == 0)
         else
           @maruchi_top_shoot = false
