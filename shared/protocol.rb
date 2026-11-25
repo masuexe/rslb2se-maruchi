@@ -5,7 +5,7 @@
 #==============================================================================
 module Maruchi
   module Protocol
-    VERSION = 1
+    VERSION = 2
 
     # Escapes delimiters (\t, \n, \r, ;, ,, %) so arbitrary UTF-8 strings (Chinese names, filenames) are safe
     def self.esc(str)
@@ -45,7 +45,7 @@ module Maruchi
       pack("HELLO", VERSION, esc(name), actor_id.to_i)
     end
 
-    def self.build_state_update(seq, x, y, real_x, real_y, dir, moving, char_name, char_index, actor_id, dir8, btn_mask)
+    def self.build_state_update(seq, x, y, real_x, real_y, dir, moving, char_name, char_index, actor_id, dir8, btn_mask, pattern = 1, step_anime = false)
       pack(
         "PSTATE",
         seq.to_i,
@@ -59,12 +59,14 @@ module Maruchi
         char_index.to_i,
         actor_id.to_i,
         dir8.to_i,
-        btn_mask.to_i
+        btn_mask.to_i,
+        pattern.to_i,
+        step_anime ? 1 : 0
       )
     end
 
-    def self.build_action(kind, action_id, dir)
-      pack("ACTION", esc(kind), action_id.to_i, dir.to_i)
+    def self.build_action(kind, action_id, dir, dir8 = 0)
+      pack("ACTION", esc(kind), action_id.to_i, dir.to_i, dir8.to_i)
     end
 
     def self.build_ping(client_ms)
@@ -90,9 +92,10 @@ module Maruchi
       encoded.join("\t")
     end
 
-    # players: array of hashes with :id,:name,:actor_id,:team,:x,:y,:real_x,:real_y,:dir,:char_name,:char_index,:hp,:maxhp,:moving
-    # enemies: array of hashes with :id,:x,:y,:real_x,:real_y,:dir,:hp,:maxhp,:erased
-    def self.build_snapshot(server_tick, map_id, players, enemies)
+    # players: array of hashes with :id,:name,:actor_id,:team,:x,:y,:real_x,:real_y,:dir,:char_name,:char_index,:hp,:maxhp,:moving,:pattern,:step_anime
+    # enemies: array of hashes with :id,:x,:y,:real_x,:real_y,:dir,:hp,:maxhp,:erased,:opacity,:collapse_dur,:defeated
+    # tokens:  array of hashes with :id,:kind,:x,:y,:real_x,:real_y,:dir,:char_name,:char_index,:pattern,:opacity,:blend_type,:angle,:zoom_x,:zoom_y,:icon_name,:jump_y
+    def self.build_snapshot(server_tick, map_id, players, enemies, tokens = [])
       p_blob = players.collect do |p|
         [
           p[:id].to_i,
@@ -108,7 +111,9 @@ module Maruchi
           p[:char_index].to_i,
           p[:hp].to_i,
           p[:maxhp].to_i,
-          p[:moving] ? 1 : 0
+          p[:moving] ? 1 : 0,
+          (p[:pattern] || 1).to_i,
+          p[:step_anime] ? 1 : 0
         ].join(",")
       end.join(";")
 
@@ -122,11 +127,36 @@ module Maruchi
           e[:dir].to_i,
           e[:hp].to_i,
           e[:maxhp].to_i,
-          e[:erased] ? 1 : 0
+          e[:erased] ? 1 : 0,
+          (e[:opacity].nil? ? 255 : e[:opacity].to_i),
+          e[:collapse_dur].to_i,
+          e[:defeated] ? 1 : 0
         ].join(",")
       end.join(";")
 
-      pack("SNAP", server_tick.to_i, map_id.to_i, p_blob, e_blob)
+      t_blob = (tokens || []).collect do |t|
+        [
+          t[:id].to_i,
+          t[:kind].to_i,
+          t[:x].to_i,
+          t[:y].to_i,
+          t[:real_x].to_i,
+          t[:real_y].to_i,
+          t[:dir].to_i,
+          esc(t[:char_name]),
+          t[:char_index].to_i,
+          t[:pattern].to_i,
+          (t[:opacity].nil? ? 255 : t[:opacity].to_i),
+          t[:blend_type].to_i,
+          t[:angle].to_i,
+          t[:zoom_x].to_i,
+          t[:zoom_y].to_i,
+          (t[:icon_name].nil? ? -1 : t[:icon_name].to_i),
+          t[:jump_y].to_i
+        ].join(",")
+      end.join(";")
+
+      pack("SNAP", server_tick.to_i, map_id.to_i, p_blob, e_blob, t_blob)
     end
 
     def self.parse_snapshot_players(blob)
@@ -150,7 +180,9 @@ module Maruchi
           :char_index => f[10].to_i,
           :hp         => f[11].to_i,
           :maxhp      => f[12].to_i,
-          :moving     => (f[13].to_i != 0)
+          :moving     => (f[13].to_i != 0),
+          :pattern    => (f.length > 14 ? f[14].to_i : 1),
+          :step_anime => (f.length > 15 ? (f[15].to_i != 0) : false)
         })
       end
       result
@@ -164,15 +196,49 @@ module Maruchi
         f = rec.split(",", -1)
         next if f.length < 9
         result.push({
-          :id     => f[0].to_i,
-          :x      => f[1].to_i,
-          :y      => f[2].to_i,
-          :real_x => f[3].to_i,
-          :real_y => f[4].to_i,
-          :dir    => f[5].to_i,
-          :hp     => f[6].to_i,
-          :maxhp  => f[7].to_i,
-          :erased => (f[8].to_i != 0)
+          :id           => f[0].to_i,
+          :x            => f[1].to_i,
+          :y            => f[2].to_i,
+          :real_x       => f[3].to_i,
+          :real_y       => f[4].to_i,
+          :dir          => f[5].to_i,
+          :hp           => f[6].to_i,
+          :maxhp        => f[7].to_i,
+          :erased       => (f[8].to_i != 0),
+          :opacity      => (f.length > 9  ? f[9].to_i : 255),
+          :collapse_dur => (f.length > 10 ? f[10].to_i : 0),
+          :defeated     => (f.length > 11 ? (f[11].to_i != 0) : false)
+        })
+      end
+      result
+    end
+
+    def self.parse_snapshot_tokens(blob)
+      result = []
+      return result if blob.nil? || blob.empty?
+      blob.split(";").each do |rec|
+        next if rec.empty?
+        f = rec.split(",", -1)
+        next if f.length < 17
+        icon_raw = f[15].to_i
+        result.push({
+          :id         => f[0].to_i,
+          :kind       => f[1].to_i,
+          :x          => f[2].to_i,
+          :y          => f[3].to_i,
+          :real_x     => f[4].to_i,
+          :real_y     => f[5].to_i,
+          :dir        => f[6].to_i,
+          :char_name  => unesc(f[7]),
+          :char_index => f[8].to_i,
+          :pattern    => f[9].to_i,
+          :opacity    => f[10].to_i,
+          :blend_type => f[11].to_i,
+          :angle      => f[12].to_i,
+          :zoom_x     => f[13].to_i,
+          :zoom_y     => f[14].to_i,
+          :icon_name  => (icon_raw >= 0 ? icon_raw : nil),
+          :jump_y     => f[16].to_i
         })
       end
       result

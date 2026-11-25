@@ -1,11 +1,40 @@
 #==============================================================================
-# Maruchi Step 3 Co-op MVP Client (Ruby 1.8.1 / RGSS2 compatible)
+# Maruchi Co-op Client (Step 4.1: Projectiles, Actions, FX, Enemy Death & Drops)
+# Strictly Ruby 1.8.1 / RGSS2 compatible
 # - Press F7 on Title or Map to connect/join the headless server (or AUTO_JOIN=1)
-# - Renders remote players with smooth real_x/real_y interpolation & name tags
-# - Syncs authoritative enemy positions & HP from the headless server
-# - Forwards local XAS weapon shots (shoot) to the server
+# - Renders remote players with smooth interpolation, action poses & name tags
+# - Renders server-authoritative projectiles (Token_Bullet) & item drops (treasure)
+# - Syncs authoritative combat animations, damage popups, SEs, enemy collapse & drops
 #==============================================================================
 if Maruchi::Config::MODS[:coop_client]
+
+  #----------------------------------------------------------------------------
+  # Lightweight Battler proxy for Remote Players so native Sprite_Character
+  # can display damage popups & item pickup text seamlessly
+  #----------------------------------------------------------------------------
+  class Maruchi_RemoteBattler
+    attr_accessor :hp, :maxhp, :mp, :maxmp
+    attr_accessor :damage, :damage_pop, :damage_type, :critical
+    attr_accessor :no_damage_pop, :defeated, :breath_effect
+
+    def initialize
+      @hp = 100
+      @maxhp = 100
+      @mp = 100
+      @maxmp = 100
+      @damage = nil
+      @damage_pop = false
+      @damage_type = ""
+      @critical = false
+      @no_damage_pop = false
+      @defeated = false
+      @breath_effect = false
+    end
+
+    def dead?
+      @hp <= 0
+    end
+  end
 
   #----------------------------------------------------------------------------
   # Remote player entity rendered by Sprite_Character on Spriteset_Map
@@ -13,6 +42,7 @@ if Maruchi::Config::MODS[:coop_client]
   class Game_RemotePlayer < Game_Character
     attr_accessor :player_id, :player_name, :actor_id, :team, :hp, :maxhp
     attr_accessor :target_real_x, :target_real_y, :remote_moving
+    attr_accessor :remote_pattern, :remote_step_anime
     attr_accessor :erased, :can_update, :throw_active, :battler
 
     def initialize(player_id, name)
@@ -26,7 +56,7 @@ if Maruchi::Config::MODS[:coop_client]
       @erased = false
       @can_update = true
       @throw_active = false
-      @battler = nil
+      @battler = Maruchi_RemoteBattler.new
       @through = true
       @walk_anime = true
       @step_anime = false
@@ -34,6 +64,8 @@ if Maruchi::Config::MODS[:coop_client]
       @target_real_x = 0
       @target_real_y = 0
       @remote_moving = false
+      @remote_pattern = 1
+      @remote_step_anime = false
       @initialized_pos = false
     end
 
@@ -43,12 +75,16 @@ if Maruchi::Config::MODS[:coop_client]
       @team        = p[:team]
       @hp          = p[:hp]
       @maxhp       = p[:maxhp]
+      @battler.hp    = @hp
+      @battler.maxhp = @maxhp
       @direction   = p[:dir] if [2, 4, 6, 8].include?(p[:dir])
       @x           = p[:x]
       @y           = p[:y]
       @target_real_x = p[:real_x]
       @target_real_y = p[:real_y]
       @remote_moving = p[:moving]
+      @remote_pattern = p[:pattern] if p[:pattern]
+      @remote_step_anime = !!p[:step_anime]
 
       if p[:char_name] && !p[:char_name].empty?
         if @character_name != p[:char_name] || @character_index != p[:char_index]
@@ -69,26 +105,110 @@ if Maruchi::Config::MODS[:coop_client]
       dx = @target_real_x - @real_x
       dy = @target_real_y - @real_y
       if dx.abs > 1024 || dy.abs > 1024
-        # Snap on large teleport
         @real_x = @target_real_x
         @real_y = @target_real_y
       else
-        @real_x += (dx / 3)
-        @real_y += (dy / 3)
+        @real_x += (dx / 2)
+        @real_y += (dy / 2)
         @real_x = @target_real_x if dx.abs < 4
         @real_y = @target_real_y if dy.abs < 4
       end
 
-      # Drive walking animation while moving or interpolating
-      if @remote_moving || dx.abs > 8 || dy.abs > 8
+      # Sync action pose frame directly when step_anime (weapon swing / cast) is active
+      if @remote_step_anime
+        @step_anime = true
+        @pattern = @remote_pattern
+        @anime_count = 0
+      elsif @remote_moving || dx.abs > 8 || dy.abs > 8
+        @step_anime = false
         @anime_count += 1.5
         if @anime_count >= 12
           @pattern = (@pattern + 1) % 4
           @anime_count = 0
         end
       else
+        @step_anime = false
         @pattern = @original_pattern
         @anime_count = 0
+      end
+    end
+  end
+
+  #----------------------------------------------------------------------------
+  # Authoritative server Token_Event proxy (Projectiles & Dropped Treasures)
+  # Rendered natively by Sprite_Character on Spriteset_Map
+  #----------------------------------------------------------------------------
+  class Game_RemoteToken < Game_Character
+    attr_accessor :token_id, :token_kind
+    attr_accessor :target_real_x, :target_real_y, :remote_jump_y
+    attr_accessor :erased, :can_update, :throw_active, :battler
+
+    def initialize(token_id)
+      super()
+      @token_id = token_id
+      @token_kind = 0
+      @erased = false
+      @can_update = true
+      @throw_active = false
+      @battler = nil
+      @through = true
+      @priority_type = 1
+      @target_real_x = 0
+      @target_real_y = 0
+      @remote_jump_y = 0
+      @initialized_pos = false
+      @tool_id = 0
+      @tool_effect = ""
+      @icon_name = nil
+      @treasure = nil
+      @treasure_time = 0
+      @treasure_float = [0, 0, 0, 0]
+      @temp_id = 0
+      @collapse_duration = 0
+      @knock_back_duration = nil
+    end
+
+    def apply_snapshot(t)
+      @token_kind = t[:kind]
+      @x = t[:x]
+      @y = t[:y]
+      @target_real_x = t[:real_x]
+      @target_real_y = t[:real_y]
+      @direction = t[:dir] if [2, 4, 6, 8].include?(t[:dir])
+      @character_name = t[:char_name] || ""
+      @character_index = t[:char_index].to_i
+      @pattern = t[:pattern].to_i
+      @opacity = t[:opacity].to_i
+      @blend_type = t[:blend_type].to_i
+      @angle = t[:angle].to_f
+      @zoom_x = t[:zoom_x].to_f / 100.0
+      @zoom_y = t[:zoom_y].to_f / 100.0
+      @icon_name = t[:icon_name]
+      @remote_jump_y = t[:jump_y].to_i
+      @priority_type = (@token_kind == 1) ? 1 : 2
+
+      unless @initialized_pos
+        @real_x = @target_real_x
+        @real_y = @target_real_y
+        @initialized_pos = true
+      end
+    end
+
+    def screen_y
+      super - @remote_jump_y
+    end
+
+    def update
+      dx = @target_real_x - @real_x
+      dy = @target_real_y - @real_y
+      if dx.abs > 1024 || dy.abs > 1024
+        @real_x = @target_real_x
+        @real_y = @target_real_y
+      else
+        @real_x += (dx / 2)
+        @real_y += (dy / 2)
+        @real_x = @target_real_x if dx.abs < 4
+        @real_y = @target_real_y if dy.abs < 4
       end
     end
   end
@@ -180,11 +300,12 @@ if Maruchi::Config::MODS[:coop_client]
       @server_map_id = nil
       @server_mode = "coop"
       @remote_players = {}
+      @remote_tokens  = {}
+      @enemy_targets  = {}
       @seq = 0
       @send_tick = 0
       @ping_tick = 0
       @rtt_ms = nil
-      @pending_transfer = nil
       @last_state = Maruchi::Net::STATE_DISCONNECTED
       @status_note = "F7: Join Coop"
 
@@ -192,6 +313,7 @@ if Maruchi::Config::MODS[:coop_client]
       def self.connected?;      @welcomed && Maruchi::Net.connected?; end
       def self.my_id;           @my_id;          end
       def self.remote_players;  @remote_players; end
+      def self.remote_tokens;   @remote_tokens;  end
 
       def self.hud_text
         if connected?
@@ -218,7 +340,8 @@ if Maruchi::Config::MODS[:coop_client]
         @welcomed = false
         @my_id = nil
         @remote_players.clear
-        @pending_transfer = nil
+        @remote_tokens.clear
+        @enemy_targets.clear
         @status_note = "Connecting..."
         Maruchi::Log.info("Connecting to #{host}:#{port} as '#{Maruchi::Config::PLAYER_NAME}'...")
         Maruchi::Net.connect(host, port)
@@ -231,6 +354,8 @@ if Maruchi::Config::MODS[:coop_client]
         @welcomed = false
         @my_id = nil
         @remote_players.clear
+        @remote_tokens.clear
+        @enemy_targets.clear
         @status_note = "Offline (F7)"
       end
 
@@ -241,6 +366,9 @@ if Maruchi::Config::MODS[:coop_client]
           aid = 1 unless $data_actors && $data_actors[aid]
           $game_party.add_actor(aid)
         end
+
+        @remote_tokens.clear
+        @enemy_targets.clear
 
         if $game_map && $game_player
           $game_message.clear if $game_message
@@ -259,9 +387,9 @@ if Maruchi::Config::MODS[:coop_client]
         end
       end
 
-      def self.send_action(kind, action_id, dir)
+      def self.send_action(kind, action_id, dir, dir8 = 0)
         return unless connected?
-        Maruchi::Net.send_msg(Maruchi::Protocol.build_action(kind, action_id, dir))
+        Maruchi::Net.send_msg(Maruchi::Protocol.build_action(kind, action_id, dir, dir8))
       end
 
       def self.update
@@ -289,17 +417,19 @@ if Maruchi::Config::MODS[:coop_client]
         end
 
         # Drain inbound frames
-        Maruchi::Net.poll_all(64).each do |payload|
+        Maruchi::Net.poll_all(128).each do |payload|
           handle_message(payload)
         end
 
-        # Update remote player interpolation
+        # Smooth interpolation for remote players, tokens, and enemies
         @remote_players.each_value { |rp| rp.update }
+        @remote_tokens.each_value  { |tk| tk.update }
+        update_enemy_interpolation if connected? && $scene.is_a?(Scene_Map) && $game_map
 
-        # Send local player state at 20Hz (every 3 frames) while on Scene_Map
+        # Send local player state at 30Hz (every 2 frames) while on Scene_Map
         if connected? && $scene.is_a?(Scene_Map) && $game_player && $game_map
           @send_tick += 1
-          if @send_tick >= 3
+          if @send_tick >= 2
             @send_tick = 0
             @seq += 1
             aid = ($game_party && $game_party.members[0]) ? $game_party.members[0].id : Maruchi::Config::ACTOR_ID
@@ -315,7 +445,9 @@ if Maruchi::Config::MODS[:coop_client]
               $game_player.character_index,
               aid,
               Input.dir8,
-              0
+              0,
+              $game_player.pattern,
+              $game_player.step_anime
             )
             Maruchi::Net.send_msg(msg)
           end
@@ -354,10 +486,11 @@ if Maruchi::Config::MODS[:coop_client]
 
         when "SNAP"
           return unless @welcomed && @my_id
-          # SNAP server_tick map_id players_blob enemies_blob
+          # SNAP server_tick map_id players_blob enemies_blob [tokens_blob]
           snap_map = f[2].to_i
           players  = Maruchi::Protocol.parse_snapshot_players(f[3])
           enemies  = Maruchi::Protocol.parse_snapshot_enemies(f[4])
+          tokens   = (f.length > 5) ? Maruchi::Protocol.parse_snapshot_tokens(f[5]) : []
 
           seen_ids = {}
           players.each do |p|
@@ -372,7 +505,6 @@ if Maruchi::Config::MODS[:coop_client]
             end
             rp.apply_snapshot(p)
           end
-          # Remove disconnected players
           @remote_players.keys.each do |pid|
             unless seen_ids[pid]
               @remote_players.delete(pid)
@@ -380,14 +512,13 @@ if Maruchi::Config::MODS[:coop_client]
             end
           end
 
-          # Apply authoritative enemy coordinates & HP when on matching map
           if $scene.is_a?(Scene_Map) && $game_map && $game_map.map_id == snap_map
             apply_enemy_snapshots(enemies)
+            apply_token_snapshots(tokens)
           end
 
         when "EVENT"
-          kind = Maruchi::Protocol.unesc(f[1])
-          Maruchi::Log.info("Server EVENT: #{kind} #{f[2..-1].inspect}")
+          handle_server_event(f)
 
         when "PONG"
           sent_ms = f[1].to_i
@@ -397,21 +528,219 @@ if Maruchi::Config::MODS[:coop_client]
         end
       end
 
+      def self.find_fx_target(t_type, t_id)
+        case t_type
+        when "P"
+          return $game_player if t_id == @my_id
+          return @remote_players[t_id]
+        when "E"
+          return ($game_map ? $game_map.events[t_id] : nil)
+        when "T"
+          return @remote_tokens[t_id]
+        end
+        nil
+      end
+
+      def self.handle_server_event(f)
+        kind = Maruchi::Protocol.unesc(f[1])
+        case kind
+        when "FX_ANI"
+          t_type  = Maruchi::Protocol.unesc(f[2])
+          t_id    = f[3].to_i
+          anim_id = f[4].to_i
+          return if anim_id <= 0
+          target = find_fx_target(t_type, t_id)
+          target.animation_id = anim_id if target
+
+        when "FX_DMG"
+          t_type   = Maruchi::Protocol.unesc(f[2])
+          t_id     = f[3].to_i
+          dmg_str  = Maruchi::Protocol.unesc(f[4])
+          dmg_type = Maruchi::Protocol.unesc(f[5])
+          crit     = (f[6].to_i != 0)
+          target = find_fx_target(t_type, t_id)
+          if target && target.respond_to?(:battler) && target.battler
+            b = target.battler
+            val = (dmg_str =~ /\A-?\d+\z/) ? dmg_str.to_i : dmg_str
+            b.damage      = val
+            b.damage_type = dmg_type
+            b.critical    = crit if b.respond_to?(:critical=)
+            b.damage_pop  = true
+          end
+
+        when "FX_SE"
+          se_name = Maruchi::Protocol.unesc(f[2])
+          vol     = f[3].to_i
+          pitch   = f[4].to_i
+          begin
+            Audio.se_play(se_name, vol > 0 ? vol : 80, pitch > 0 ? pitch : 100)
+          rescue Exception
+          end
+
+        when "ENEMY_DEAD"
+          ev_id    = f[2].to_i
+          enemy_id = f[3].to_i
+          exp      = f[4].to_i
+          gold     = f[5].to_i
+          handle_enemy_dead(ev_id, enemy_id, exp, gold)
+
+        when "PICKUP"
+          picker_id = f[2].to_i
+          tr_kind   = f[3].to_i
+          tr_id     = f[4].to_i
+          handle_treasure_pickup(picker_id, tr_kind, tr_id)
+
+        when "JOIN", "LEAVE"
+          Maruchi::Log.info("Server EVENT: #{kind} #{f[2..-1].inspect}")
+        end
+      end
+
+      def self.handle_enemy_dead(ev_id, enemy_id, exp, gold)
+        Sound.play_enemy_collapse rescue nil
+
+        # Trigger local collapse visual + EXP/Gold popup on the enemy sprite
+        if $game_map && $game_map.events[ev_id]
+          ev = $game_map.events[ev_id]
+          if ev.respond_to?(:battler) && ev.battler
+            ev.battler.hp = 0
+            ev.battler.defeated = true if ev.battler.respond_to?(:defeated=)
+          end
+          ev.through = true
+          ev.collapse_duration = 60 if ev.respond_to?(:collapse_duration=)
+          if $data_enemies && $data_enemies[enemy_id]
+            en = $data_enemies[enemy_id]
+            if en.note =~ /<Defeated Ani = (\d+)>/
+              ev.animation_id = $1.to_i
+            end
+          end
+        end
+
+        # Grant authoritative EXP, Gold, and kill counters to local party
+        if $game_variables
+          $game_variables[6] = $game_variables[6].to_i + 1
+          $game_variables[39] = $game_variables[39].to_i + 1
+        end
+        if $game_party && !$game_party.members.empty?
+          if exp > 0
+            case ($game_variables ? $game_variables[37].to_i : 0)
+            when 0
+              $game_party.members[0].gain_exp(exp, false)
+            when 1
+              $game_party.members.each { |a| a.gain_exp(exp, false) }
+            when 2
+              share = exp / [$game_party.members.size, 1].max
+              $game_party.members.each { |a| a.gain_exp(share, false) }
+            end
+          end
+          $game_party.gain_gold(gold) if gold > 0
+        end
+      end
+
+      def self.handle_treasure_pickup(picker_id, tr_kind, tr_id)
+        item = case tr_kind
+               when 1 then ($data_items ? $data_items[tr_id] : nil)
+               when 2 then ($data_weapons ? $data_weapons[tr_id] : nil)
+               when 3 then ($data_armors ? $data_armors[tr_id] : nil)
+               else nil
+               end
+        return unless item
+
+        if picker_id == @my_id && $game_player && $game_party
+          name_pop = true
+          case tr_kind
+          when 1
+            if $game_player.respond_to?(:can_execute_field_item_effect?) && $game_player.can_execute_field_item_effect?(item)
+              name_pop = false
+            else
+              $game_party.gain_item(item, 1)
+            end
+            $game_map.need_refresh = true if $game_map
+          when 2
+            $game_party.gain_item(item, 1, false)
+          when 3
+            $game_party.gain_item(item, 1, false)
+          end
+          if item.note =~ /<Drop Ani = (\d+)>/
+            $game_player.animation_id = $1.to_i
+          end
+          if defined?(XAS_DAMAGE_POP) && XAS_DAMAGE_POP::DAMAGE_ITEM_POP && name_pop && $game_player.battler
+            $game_player.battler.damage = item.name.to_s
+            $game_player.battler.damage_pop = true
+            $game_player.battler.damage_type = "Item"
+          end
+        else
+          rp = @remote_players[picker_id]
+          if rp
+            if item.note =~ /<Drop Ani = (\d+)>/
+              rp.animation_id = $1.to_i
+            end
+            if rp.battler
+              rp.battler.damage = item.name.to_s
+              rp.battler.damage_pop = true
+              rp.battler.damage_type = "Item"
+            end
+          end
+        end
+      end
+
       def self.apply_enemy_snapshots(enemies)
         enemies.each do |e|
           ev = $game_map.events[e[:id]]
           next unless ev
           ev.instance_variable_set(:@x, e[:x])
           ev.instance_variable_set(:@y, e[:y])
-          ev.instance_variable_set(:@real_x, e[:real_x])
-          ev.instance_variable_set(:@real_y, e[:real_y])
           ev.instance_variable_set(:@direction, e[:dir]) if [2, 4, 6, 8].include?(e[:dir])
+
+          # Record interpolation target (snap if first time or large teleport)
+          prev = @enemy_targets[e[:id]]
+          if prev.nil? || (e[:real_x] - ev.real_x).abs > 1024 || (e[:real_y] - ev.real_y).abs > 1024
+            ev.instance_variable_set(:@real_x, e[:real_x])
+            ev.instance_variable_set(:@real_y, e[:real_y])
+          end
+          @enemy_targets[e[:id]] = [e[:real_x], e[:real_y]]
+
           if ev.respond_to?(:battler) && ev.battler && ev.battler.respond_to?(:hp=)
             ev.battler.hp = e[:hp] if ev.battler.hp != e[:hp]
+            if e[:defeated] && ev.battler.respond_to?(:defeated=)
+              ev.battler.defeated = true
+            end
           end
           if e[:erased] && !ev.instance_variable_get(:@erased)
             ev.erase
           end
+        end
+      end
+
+      def self.update_enemy_interpolation
+        @enemy_targets.each do |ev_id, pos|
+          ev = $game_map.events[ev_id]
+          next unless ev && !ev.erased
+          rx = ev.real_x
+          ry = ev.real_y
+          dx = pos[0] - rx
+          dy = pos[1] - ry
+          next if dx == 0 && dy == 0
+          nx = (dx.abs < 4) ? pos[0] : (rx + (dx / 2))
+          ny = (dy.abs < 4) ? pos[1] : (ry + (dy / 2))
+          ev.instance_variable_set(:@real_x, nx)
+          ev.instance_variable_set(:@real_y, ny)
+        end
+      end
+
+      def self.apply_token_snapshots(tokens)
+        seen = {}
+        tokens.each do |t|
+          tid = t[:id]
+          seen[tid] = true
+          rt = @remote_tokens[tid]
+          if rt.nil?
+            rt = Game_RemoteToken.new(tid)
+            @remote_tokens[tid] = rt
+          end
+          rt.apply_snapshot(t)
+        end
+        @remote_tokens.keys.each do |tid|
+          @remote_tokens.delete(tid) unless seen[tid]
         end
       end
     end
@@ -424,9 +753,7 @@ if Maruchi::Config::MODS[:coop_client]
     alias maruchi_coop_title_start start
     def start
       maruchi_coop_title_start
-      @maruchi_auto_triggered = false
       if Maruchi::Config::AUTO_JOIN
-        @maruchi_auto_triggered = true
         Maruchi::Coop.connect_and_join
       end
     end
@@ -462,7 +789,20 @@ if Maruchi::Config::MODS[:coop_client]
   end
 
   #----------------------------------------------------------------------------
-  # Hook Spriteset_Map: Render remote players, name tags, and status HUD
+  # Hook Sprite_Character: Protect enemy HP meter plugin (180) from RemotePlayer
+  #----------------------------------------------------------------------------
+  class Sprite_Character < Sprite_Base
+    if method_defined?(:update_battler_meter)
+      alias maruchi_coop_update_battler_meter update_battler_meter
+      def update_battler_meter
+        return if @character.is_a?(Game_RemotePlayer) || @character.is_a?(Game_RemoteToken)
+        maruchi_coop_update_battler_meter
+      end
+    end
+  end
+
+  #----------------------------------------------------------------------------
+  # Hook Spriteset_Map: Render remote players, remote tokens, name tags & HUD
   #----------------------------------------------------------------------------
   class Spriteset_Map
     alias maruchi_coop_create_characters create_characters
@@ -470,6 +810,7 @@ if Maruchi::Config::MODS[:coop_client]
       maruchi_coop_create_characters
       @maruchi_remote_sprites = {}
       @maruchi_remote_tags    = {}
+      @maruchi_token_sprites  = {}
       @maruchi_hud = Sprite_MaruchiHud.new(@viewport3)
     end
 
@@ -477,6 +818,7 @@ if Maruchi::Config::MODS[:coop_client]
     def update_characters
       maruchi_coop_update_characters
       update_maruchi_remote_sprites
+      update_maruchi_token_sprites
       @maruchi_hud.update if @maruchi_hud
     end
 
@@ -485,7 +827,6 @@ if Maruchi::Config::MODS[:coop_client]
       begin
         remotes = Maruchi::Coop.remote_players
 
-        # Add sprites for new remote players
         remotes.each do |pid, rp|
           unless @maruchi_remote_sprites[pid]
             @maruchi_remote_sprites[pid] = Sprite_Character.new(@viewport1, rp)
@@ -494,7 +835,6 @@ if Maruchi::Config::MODS[:coop_client]
           end
         end
 
-        # Remove sprites for departed remote players
         @maruchi_remote_sprites.keys.each do |pid|
           unless remotes[pid]
             sp = @maruchi_remote_sprites.delete(pid)
@@ -511,6 +851,30 @@ if Maruchi::Config::MODS[:coop_client]
       end
     end
 
+    def update_maruchi_token_sprites
+      return unless @maruchi_token_sprites
+      begin
+        tokens = Maruchi::Coop.remote_tokens
+
+        tokens.each do |tid, tk|
+          unless @maruchi_token_sprites[tid]
+            @maruchi_token_sprites[tid] = Sprite_Character.new(@viewport1, tk)
+          end
+        end
+
+        @maruchi_token_sprites.keys.each do |tid|
+          unless tokens[tid]
+            sp = @maruchi_token_sprites.delete(tid)
+            sp.dispose if sp && !sp.disposed?
+          end
+        end
+
+        @maruchi_token_sprites.each_value { |sp| sp.update }
+      rescue Exception => e
+        Maruchi::Log.error("Remote token sprite error: #{e.class}: #{e.message} (#{(e.backtrace || [])[0]})")
+      end
+    end
+
     alias maruchi_coop_dispose_characters dispose_characters
     def dispose_characters
       if @maruchi_remote_sprites
@@ -521,6 +885,10 @@ if Maruchi::Config::MODS[:coop_client]
         @maruchi_remote_tags.each_value { |tg| tg.dispose if tg && !tg.disposed? }
         @maruchi_remote_tags.clear
       end
+      if @maruchi_token_sprites
+        @maruchi_token_sprites.each_value { |sp| sp.dispose if sp && !sp.disposed? }
+        @maruchi_token_sprites.clear
+      end
       if @maruchi_hud
         @maruchi_hud.dispose unless @maruchi_hud.disposed?
         @maruchi_hud = nil
@@ -530,7 +898,8 @@ if Maruchi::Config::MODS[:coop_client]
   end
 
   #----------------------------------------------------------------------------
-  # Hook Game_Event: Suppress local autonomous movement for server-synced enemies
+  # Hook Game_Event: Suppress local autonomous movement, hit math & defeat math
+  # when connected to authoritative server
   #----------------------------------------------------------------------------
   class Game_Event
     alias maruchi_coop_update_self_movement update_self_movement
@@ -540,19 +909,84 @@ if Maruchi::Config::MODS[:coop_client]
       end
       maruchi_coop_update_self_movement
     end
+
+    if method_defined?(:action_effect)
+      alias maruchi_coop_event_action_effect action_effect
+      def action_effect(bullet, action_id)
+        if Maruchi::Coop.connected? && respond_to?(:battler) && battler.is_a?(Game_Enemy)
+          return false
+        end
+        maruchi_coop_event_action_effect(bullet, action_id)
+      end
+    end
+
+    if method_defined?(:execute_enemy_defeated_process)
+      alias maruchi_coop_enemy_defeated execute_enemy_defeated_process
+      def execute_enemy_defeated_process
+        return if Maruchi::Coop.connected?
+        maruchi_coop_enemy_defeated
+      end
+    end
   end
 
   #----------------------------------------------------------------------------
-  # Hook Game_Player#shoot: Forward XAS weapon shots to authoritative server
+  # Hook Game_Player:
+  # - Forward top-level XAS weapon shots (shoot) to authoritative server
+  # - Suppress duplicate local Token_Bullet spawns (server streams all tokens)
+  # - Delegate treasure pickup to authoritative server
   #----------------------------------------------------------------------------
   class Game_Player
     if method_defined?(:shoot)
       alias maruchi_coop_shoot shoot
       def shoot(action_id)
         if Maruchi::Coop.connected? && action_id.to_i > 0
-          Maruchi::Coop.send_action("SHOOT", action_id.to_i, @direction)
+          @maruchi_top_shoot = (@force_action_times.to_i == 0)
+        else
+          @maruchi_top_shoot = false
         end
-        maruchi_coop_shoot(action_id)
+        begin
+          maruchi_coop_shoot(action_id)
+        ensure
+          @maruchi_top_shoot = false
+        end
+      end
+    end
+
+    if method_defined?(:tools_on_map?)
+      alias maruchi_coop_tools_on_map? tools_on_map?
+      def tools_on_map?(skill_id)
+        return false if Maruchi::Coop.connected?
+        maruchi_coop_tools_on_map?(skill_id)
+      end
+    end
+
+    if method_defined?(:execute_call_event)
+      alias maruchi_coop_execute_call_event execute_call_event
+      def execute_call_event(action_id)
+        if Maruchi::Coop.connected?
+          if @maruchi_top_shoot && action_id.to_i > 0
+            @maruchi_top_shoot = false
+            Maruchi::Coop.send_action("SHOOT", action_id.to_i, @direction, Input.dir8)
+          end
+          return nil
+        end
+        maruchi_coop_execute_call_event(action_id)
+      end
+    end
+
+    if method_defined?(:fake_shoot)
+      alias maruchi_coop_fake_shoot fake_shoot
+      def fake_shoot(action_id, pos, waittime = 1)
+        return nil if Maruchi::Coop.connected?
+        maruchi_coop_fake_shoot(action_id, pos, waittime)
+      end
+    end
+
+    if method_defined?(:check_treasure_here)
+      alias maruchi_coop_check_treasure_here check_treasure_here
+      def check_treasure_here
+        return if Maruchi::Coop.connected?
+        maruchi_coop_check_treasure_here
       end
     end
   end
