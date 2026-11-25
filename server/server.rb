@@ -2,7 +2,8 @@
 
 #==============================================================================
 # Maruchi Cross-Platform Authoritative Headless Server (Linux & Windows)
-# Step 4.2: Multi-player Hit Detection, Independent HP/MP, Down/Revive & PvP
+# Step 4.3: Map Transfers, Shared Switches/Variables/Self-Switches,
+#           Live Character Selection & Live CO-OP / PVP Mode Switching
 # Usage:
 #   ruby server/server.rb [--host 0.0.0.0] [--port 27890] [--map 116] [--mode coop|pvp]
 #==============================================================================
@@ -58,7 +59,6 @@ module Maruchi
       @player_obj.refresh
       @player_obj.instance_variable_set(:@maruchi_session_id, @id)
 
-      # Give each player their own authoritative battler & session link
       @player_obj.define_singleton_method(:battler) do
         @maruchi_actor || ($game_party && $game_party.members[0])
       end
@@ -230,6 +230,10 @@ module Maruchi
       @capture_se = false
       @pending_dead_enemies = []
       @pending_knockbacks = []
+      @dirty_switches = {}
+      @dirty_variables = {}
+      @dirty_self_switches = {}
+      @pending_transfer = nil
       @active_context_session = nil
     end
 
@@ -321,18 +325,23 @@ module Maruchi
       @capture_se = true
       process_client_frames
 
+      # Apply any queued authoritative map transfer before stepping map simulation
+      if @pending_transfer
+        mid, tx, ty, tdir = @pending_transfer
+        @pending_transfer = nil
+        transfer_all_to!(mid, tx, ty, tdir)
+      end
+
       @tick += 1
       Graphics.update
 
       if !@sessions.empty?
         authed_sessions = @sessions.values.select { |s| s.authed && !s.closed }
         unless authed_sessions.empty?
-          # Step 1: Drive per-player timers, multi-shoots, contact collisions, pickups, down/revive
           authed_sessions.each do |session|
             update_session_tick!(session, authed_sessions)
           end
 
-          # Step 2: Advance authoritative map/AI/projectile simulation
           first_alive = authed_sessions.find(&:alive?) || authed_sessions.first
           with_session_context(first_alive) do
             begin
@@ -344,13 +353,19 @@ module Maruchi
             end
           end
 
-          # Step 3: Check if any player dropped to 0 HP during map/projectile tick
+          # Apply map transfer if a server event / interpreter triggered reserve_transfer during map tick
+          if @pending_transfer
+            mid, tx, ty, tdir = @pending_transfer
+            @pending_transfer = nil
+            transfer_all_to!(mid, tx, ty, tdir)
+          end
+
           authed_sessions.each do |session|
             check_session_downed!(session)
           end
 
-          # Step 4: Collect & broadcast all authoritative combat FX, deaths, knockbacks, SEs
           collect_and_broadcast_fx!(authed_sessions)
+          broadcast_dirty_world_state!
 
           if (@tick % @snap_interval) == 0
             broadcast_snapshot!
@@ -382,6 +397,99 @@ module Maruchi
     def record_player_knockback(session_id, dir, power)
       return if power.to_i <= 0
       @pending_knockbacks << [session_id.to_i, dir.to_i, power.to_i]
+    end
+
+    def record_switch_change(switch_id, value)
+      return if switch_id.to_i <= 0
+      @dirty_switches[switch_id.to_i] = !!value
+    end
+
+    def record_variable_change(var_id, value)
+      return if var_id.to_i <= 0
+      @dirty_variables[var_id.to_i] = value.to_i
+    end
+
+    def record_self_switch_change(key, value)
+      return unless key.is_a?(Array) && key.length >= 3
+      @dirty_self_switches[key] = !!value
+    end
+
+    def queue_map_transfer(map_id, x = -1, y = -1, dir = 2)
+      return unless valid_map_id?(map_id)
+      @pending_transfer = [map_id.to_i, x.to_i, y.to_i, [2, 4, 6, 8].include?(dir.to_i) ? dir.to_i : 2]
+    end
+
+    def valid_map_id?(map_id)
+      mid = map_id.to_i
+      return false if mid <= 0
+      return false unless $data_mapinfos && $data_mapinfos[mid]
+      path = File.join(@game_dir, "Data", sprintf("Map%03d.rvdata", mid))
+      File.file?(path)
+    end
+
+    def transfer_all_to!(map_id, req_x = -1, req_y = -1, dir = 2)
+      mid = map_id.to_i
+      unless valid_map_id?(mid)
+        log("WARN invalid map transfer target: Map ##{mid}")
+        return false
+      end
+
+      $game_map.clear_tokens if $game_map.respond_to?(:clear_tokens)
+      $game_map.interpreter.clear if $game_map.interpreter
+      $game_map.setup(mid)
+      @map_id = mid
+
+      if req_x >= 0 && req_x < $game_map.width && req_y >= 0 && req_y < $game_map.height
+        @spawn_x = req_x
+        @spawn_y = req_y
+      else
+        @spawn_x, @spawn_y = find_safe_spawn($game_map)
+      end
+
+      @sessions.each_value do |s|
+        next if s.closed
+        s.x = @spawn_x
+        s.y = @spawn_y
+        s.real_x = @spawn_x * 256
+        s.real_y = @spawn_y * 256
+        s.dir = dir if [2, 4, 6, 8].include?(dir)
+        s.down_timer = 0
+        if s.actor
+          s.actor.recover_all if s.actor.hp <= 0
+          s.actor.invunerable_duration = 120 if s.actor.respond_to?(:invunerable_duration=)
+        end
+        s.sync_player_obj!
+      end
+
+      map_name = ($data_mapinfos && $data_mapinfos[mid]) ? $data_mapinfos[mid].name : ""
+      log("Transferred all players to Map ##{mid} '#{map_name}' at (#{@spawn_x},#{@spawn_y}) enemies=#{active_enemy_events.size}")
+
+      broadcast_frame(Maruchi::Protocol.build_map_transfer(@map_id, @spawn_x, @spawn_y, dir))
+      @sessions.each_value do |s|
+        next if s.closed || !s.authed
+        send_world_state_to(s)
+      end
+      broadcast_snapshot!
+      true
+    end
+
+    def switch_mode!(new_mode)
+      m = (new_mode.to_s.downcase == "pvp") ? "pvp" : "coop"
+      return if m == @mode
+      @mode = m
+      @sessions.each_value do |s|
+        next if s.closed
+        s.team = (@mode == "pvp") ? s.id : 0
+        s.down_timer = 0
+        if s.actor
+          s.actor.recover_all
+          s.actor.invunerable_duration = 120 if s.actor.respond_to?(:invunerable_duration=)
+        end
+        s.sync_player_obj!
+      end
+      log("Room mode switched to #{@mode.upcase}")
+      broadcast_frame(Maruchi::Protocol.build_event("MODE_CHANGE", @mode))
+      broadcast_snapshot!
     end
 
     def with_session_context(session)
@@ -439,7 +547,6 @@ module Maruchi
 
     def update_session_tick!(session, authed_sessions)
       if session.downed?
-        # Co-op rescue: nearby living teammate accelerates revive 4x (1.25s instead of 5s)
         speed = 1
         if @mode != "pvp"
           ally_near = authed_sessions.any? do |other|
@@ -456,7 +563,6 @@ module Maruchi
       with_session_context(session) do
         po = session.player_obj
         b  = session.actor
-        # Advance invulnerability frames & knockback countdown per player
         if b
           b.invunerable_duration -= 1 if b.respond_to?(:invunerable_duration) && b.invunerable_duration.to_i > 0
           if b.respond_to?(:state_duration) && b.state_duration.is_a?(Hash)
@@ -515,7 +621,6 @@ module Maruchi
       session.actor.defeated = false if session.actor.respond_to?(:defeated=)
       session.player_obj.knock_back_duration = nil
       session.down_timer = 0
-      # In PvP respawn at safe spawn; in Co-op revive in-place if passable else safe spawn
       if @mode == "pvp" || !$game_map.passable?(session.x, session.y)
         session.x = @spawn_x
         session.y = @spawn_y
@@ -531,15 +636,69 @@ module Maruchi
       server = self
       $MARUCHI_SERVER = server
 
-      # Ensure Game_Map#id exists (XAS make_treasure calls $game_map.id)
       unless Game_Map.method_defined?(:id)
         Game_Map.class_eval do
           alias_method :id, :map_id
         end
       end
 
-      # Isolate $game_party.members[0] per active session context so all XAS & custom scripts
-      # reading $game_party.members[0] see the active player's independent Game_Actor!
+      # Track shared switches, variables & self-switches mutations for delta broadcast
+      Game_Switches.class_eval do
+        unless method_defined?(:maruchi_orig_set)
+          alias_method :maruchi_orig_set, :[]=
+          def []=(switch_id, value)
+            prev = self[switch_id]
+            res = maruchi_orig_set(switch_id, value)
+            if $MARUCHI_SERVER && (!!prev != !!value)
+              $MARUCHI_SERVER.record_switch_change(switch_id, value)
+            end
+            res
+          end
+        end
+      end
+
+      Game_Variables.class_eval do
+        unless method_defined?(:maruchi_orig_set)
+          alias_method :maruchi_orig_set, :[]=
+          def []=(var_id, value)
+            prev = self[var_id]
+            res = maruchi_orig_set(var_id, value)
+            if $MARUCHI_SERVER && (prev.to_i != value.to_i)
+              $MARUCHI_SERVER.record_variable_change(var_id, value)
+            end
+            res
+          end
+        end
+      end
+
+      Game_SelfSwitches.class_eval do
+        unless method_defined?(:maruchi_orig_set)
+          alias_method :maruchi_orig_set, :[]=
+          def []=(key, value)
+            prev = self[key]
+            res = maruchi_orig_set(key, value)
+            if $MARUCHI_SERVER && (!!prev != !!value)
+              $MARUCHI_SERVER.record_self_switch_change(key, value)
+            end
+            res
+          end
+        end
+      end
+
+      # Intercept map transfer commands triggered by server events / doors
+      Game_Player.class_eval do
+        if method_defined?(:reserve_transfer) && !method_defined?(:maruchi_orig_srv_reserve_transfer)
+          alias_method :maruchi_orig_srv_reserve_transfer, :reserve_transfer
+          def reserve_transfer(map_id, x, y, direction = 2)
+            if $MARUCHI_SERVER
+              $MARUCHI_SERVER.queue_map_transfer(map_id, x, y, direction)
+              return
+            end
+            maruchi_orig_srv_reserve_transfer(map_id, x, y, direction)
+          end
+        end
+      end
+
       Game_Party.class_eval do
         unless method_defined?(:maruchi_orig_members)
           alias_method :maruchi_orig_members, :members
@@ -553,7 +712,6 @@ module Maruchi
         end
       end
 
-      # Hook Audio.se_play to capture authoritative combat/action SEs for broadcast
       unless Audio.respond_to?(:maruchi_orig_se_play)
         Audio.singleton_class.class_eval do
           alias_method :maruchi_orig_se_play, :se_play
@@ -565,7 +723,6 @@ module Maruchi
         end
       end
 
-      # Hook XAS_ACTION#check_event_trigger_attack so bullets/skills hit ALL connected players + enemies
       if defined?(XAS_ACTION) && XAS_ACTION.method_defined?(:check_event_trigger_attack)
         XAS_ACTION.module_eval do
           unless method_defined?(:maruchi_orig_check_event_trigger_attack)
@@ -620,7 +777,6 @@ module Maruchi
         end
       end
 
-      # Hook XRXS_BattlerAttachment#action_can_hit_target? for PvP hostile player-vs-player hits
       if defined?(XRXS_BattlerAttachment) && XRXS_BattlerAttachment.method_defined?(:action_can_hit_target?)
         XRXS_BattlerAttachment.module_eval do
           unless method_defined?(:maruchi_orig_action_can_hit_target?)
@@ -642,7 +798,6 @@ module Maruchi
         end
       end
 
-      # Hook Game_Event#check_event_trigger_touch so enemies stepping into ANY player deal contact damage
       Game_Event.class_eval do
         if method_defined?(:check_event_trigger_touch) && !method_defined?(:maruchi_orig_ev_touch)
           alias_method :maruchi_orig_ev_touch, :check_event_trigger_touch
@@ -686,7 +841,6 @@ module Maruchi
         end
       end
 
-      # Hook Game_Character#blow to forward player knockbacks to clients & prevent server-side Scene_Gameover
       Game_Character.class_eval do
         if method_defined?(:blow) && !method_defined?(:maruchi_orig_blow)
           alias_method :maruchi_orig_blow, :blow
@@ -716,14 +870,12 @@ module Maruchi
         if method_defined?(:execute_actor_defeated_process) && !method_defined?(:maruchi_orig_actor_defeated)
           alias_method :maruchi_orig_actor_defeated, :execute_actor_defeated_process
           def execute_actor_defeated_process
-            # Handled authoritatively via down_timer / revive_session!
             return if $MARUCHI_SERVER
             maruchi_orig_actor_defeated
           end
         end
       end
 
-      # Guard make_treasure on headless server
       if defined?(XAS_BA_ItemDrop) && XAS_BA_ItemDrop.method_defined?(:make_treasure)
         XAS_BA_ItemDrop.module_eval do
           unless method_defined?(:maruchi_orig_make_treasure)
@@ -739,7 +891,52 @@ module Maruchi
       end
     end
 
-    # Headless server has no Sprite_Character, so drive enemy collapse countdown & erase here
+    def send_world_state_to(session)
+      sw_ids = []
+      sw_data = $game_switches.instance_variable_get(:@data)
+      if sw_data.is_a?(Array)
+        sw_data.each_with_index { |v, i| sw_ids << i if i > 0 && v }
+      end
+
+      var_pairs = []
+      var_data = $game_variables.instance_variable_get(:@data)
+      if var_data.is_a?(Array)
+        var_data.each_with_index { |v, i| var_pairs << [i, v.to_i] if i > 0 && v.to_i != 0 }
+      end
+
+      ssw_entries = []
+      ssw_data = $game_self_switches.instance_variable_get(:@data)
+      if ssw_data.is_a?(Hash)
+        ssw_data.each do |key, v|
+          next unless key.is_a?(Array) && key.length >= 3 && key[0].to_i == @map_id
+          ssw_entries << [key[0].to_i, key[1].to_i, key[2].to_s, !!v] if v
+        end
+      end
+
+      session.queue_frame(Maruchi::Protocol.build_world_sync(sw_ids, var_pairs, ssw_entries))
+    end
+
+    def broadcast_dirty_world_state!
+      unless @dirty_switches.empty?
+        @dirty_switches.each do |sid, val|
+          broadcast_frame(Maruchi::Protocol.build_event("SW_SET", sid, val ? 1 : 0))
+        end
+        @dirty_switches.clear
+      end
+      unless @dirty_variables.empty?
+        @dirty_variables.each do |vid, val|
+          broadcast_frame(Maruchi::Protocol.build_event("VAR_SET", vid, val))
+        end
+        @dirty_variables.clear
+      end
+      unless @dirty_self_switches.empty?
+        @dirty_self_switches.each do |key, val|
+          broadcast_frame(Maruchi::Protocol.build_event("SSW_SET", key[0].to_i, key[1].to_i, key[2].to_s, val ? 1 : 0))
+        end
+        @dirty_self_switches.clear
+      end
+    end
+
     def update_server_enemy_collapses!
       $game_map.events.values.each do |ev|
         next if ev.erased
@@ -920,6 +1117,7 @@ module Maruchi
         session.queue_frame(
           Maruchi::Protocol.build_welcome(session.id, @map_id, @spawn_x, @spawn_y, @mode, @tick_rate)
         )
+        send_world_state_to(session)
         broadcast_frame(
           Maruchi::Protocol.build_event("JOIN", session.id, session.name),
           exclude_id: session.id
@@ -983,6 +1181,47 @@ module Maruchi
           Maruchi::Protocol.build_event("ACTION", session.id, kind, action_id, session.dir),
           exclude_id: session.id
         )
+
+      when "REQ_ACTOR"
+        aid = fields[1].to_i
+        if aid > 0 && $data_actors && $data_actors[aid]
+          session.set_actor!(aid)
+          aname = $data_actors[aid].name.to_s
+          log("Player ##{session.id} switched actor to ##{aid} ('#{aname}') HP=#{session.hp}/#{session.maxhp}")
+          broadcast_frame(Maruchi::Protocol.build_event("ACTOR_CHANGED", session.id, aid, aname))
+          broadcast_snapshot!
+        end
+
+      when "REQ_TRANSFER"
+        mid  = fields[1].to_i
+        tx   = fields.length > 2 ? fields[2].to_i : -1
+        ty   = fields.length > 3 ? fields[3].to_i : -1
+        tdir = fields.length > 4 ? fields[4].to_i : 2
+        log("Player ##{session.id} requested transfer to Map ##{mid} (#{tx},#{ty})")
+        queue_map_transfer(mid, tx, ty, tdir)
+
+      when "REQ_MODE"
+        new_mode = Maruchi::Protocol.unesc(fields[1])
+        log("Player ##{session.id} requested mode '#{new_mode}'")
+        switch_mode!(new_mode)
+
+      when "REQ_INTERACT"
+        return unless session.alive?
+        ix   = fields[1].to_i
+        iy   = fields[2].to_i
+        idir = fields[3].to_i
+        session.x = ix if ix >= 0 && ix < $game_map.width
+        session.y = iy if iy >= 0 && iy < $game_map.height
+        session.dir = idir if [2, 4, 6, 8].include?(idir)
+        with_session_context(session) do
+          begin
+            po = session.player_obj
+            po.check_event_trigger_here([0, 1, 2]) if po.respond_to?(:check_event_trigger_here)
+            po.check_event_trigger_there([0, 1, 2]) if po.respond_to?(:check_event_trigger_there)
+          rescue StandardError => e
+            log("WARN interact error for player ##{session.id}: #{e.class}: #{e.message}")
+          end
+        end
 
       when "PING"
         client_ms = fields[1].to_i

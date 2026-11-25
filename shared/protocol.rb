@@ -5,7 +5,7 @@
 #==============================================================================
 module Maruchi
   module Protocol
-    VERSION = 3
+    VERSION = 4
 
     # Escapes delimiters (\t, \n, \r, ;, ,, %) so arbitrary UTF-8 strings (Chinese names, filenames) are safe
     def self.esc(str)
@@ -69,6 +69,22 @@ module Maruchi
       pack("ACTION", esc(kind), action_id.to_i, dir.to_i, dir8.to_i)
     end
 
+    def self.build_req_actor(actor_id)
+      pack("REQ_ACTOR", actor_id.to_i)
+    end
+
+    def self.build_req_transfer(map_id, x = -1, y = -1, dir = 2)
+      pack("REQ_TRANSFER", map_id.to_i, x.to_i, y.to_i, dir.to_i)
+    end
+
+    def self.build_req_mode(mode)
+      pack("REQ_MODE", esc(mode))
+    end
+
+    def self.build_req_interact(x, y, dir)
+      pack("REQ_INTERACT", x.to_i, y.to_i, dir.to_i)
+    end
+
     def self.build_ping(client_ms)
       pack("PING", client_ms.to_i)
     end
@@ -78,8 +94,43 @@ module Maruchi
       pack("WELCOME", player_id.to_i, map_id.to_i, spawn_x.to_i, spawn_y.to_i, esc(mode), tick_rate.to_i)
     end
 
-    def self.build_map_transfer(map_id, spawn_x, spawn_y)
-      pack("MAP", map_id.to_i, spawn_x.to_i, spawn_y.to_i)
+    def self.build_map_transfer(map_id, spawn_x, spawn_y, dir = 2)
+      pack("MAP", map_id.to_i, spawn_x.to_i, spawn_y.to_i, dir.to_i)
+    end
+
+    # Full world sync of non-default switches, variables, and current-map self switches
+    # sw_ids: array of integer switch IDs that are true
+    # var_pairs: array of [var_id, int_val] for non-zero variables
+    # ssw_entries: array of [map_id, ev_id, ch, bool]
+    def self.build_world_sync(sw_ids, var_pairs, ssw_entries)
+      sw_blob  = (sw_ids || []).collect { |id| id.to_i.to_s }.join(",")
+      var_blob = (var_pairs || []).collect { |pair| "#{pair[0].to_i},#{pair[1].to_i}" }.join(";")
+      ssw_blob = (ssw_entries || []).collect { |e| "#{e[0].to_i},#{e[1].to_i},#{esc(e[2])},#{e[3] ? 1 : 0}" }.join(";")
+      pack("WORLD_SYNC", sw_blob, var_blob, ssw_blob)
+    end
+
+    def self.parse_world_sync(sw_blob, var_blob, ssw_blob)
+      sw = []
+      if sw_blob && !sw_blob.empty?
+        sw_blob.split(",").each { |s| sw.push(s.to_i) unless s.empty? }
+      end
+      vars = []
+      if var_blob && !var_blob.empty?
+        var_blob.split(";").each do |rec|
+          next if rec.empty?
+          f = rec.split(",", -1)
+          vars.push([f[0].to_i, f[1].to_i]) if f.length >= 2
+        end
+      end
+      ssw = []
+      if ssw_blob && !ssw_blob.empty?
+        ssw_blob.split(";").each do |rec|
+          next if rec.empty?
+          f = rec.split(",", -1)
+          ssw.push([f[0].to_i, f[1].to_i, unesc(f[2]), (f[3].to_i != 0)]) if f.length >= 4
+        end
+      end
+      { :switches => sw, :variables => vars, :self_switches => ssw }
     end
 
     def self.build_pong(client_ms, server_tick)
