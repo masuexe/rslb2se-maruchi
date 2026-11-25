@@ -501,15 +501,18 @@ if Maruchi::Config::MODS[:coop_client]
           $game_party.add_actor(aid)
         end
 
-        @remote_tokens.clear
-        @enemy_targets.clear
+        same_map = ($game_map && $game_map.map_id == map_id && $scene.is_a?(Scene_Map))
+        unless same_map
+          @remote_tokens.clear
+          @enemy_targets.clear
+        end
         @applying_server_map = true
         begin
           if $game_map && $game_player
             $game_message.clear if $game_message
             $game_map.interpreter.clear if $game_map.interpreter
-            $game_map.clear_tokens if $game_map.respond_to?(:clear_tokens)
-            if $game_map.map_id != map_id || !$scene.is_a?(Scene_Map)
+            if !same_map
+              $game_map.clear_tokens if $game_map.respond_to?(:clear_tokens)
               $game_map.setup(map_id)
               $game_player.moveto(sx, sy)
               $game_player.direction = dir if [2, 4, 6, 8].include?(dir)

@@ -1246,8 +1246,20 @@ module Maruchi
         tx   = fields.length > 2 ? fields[2].to_i : -1
         ty   = fields.length > 3 ? fields[3].to_i : -1
         tdir = fields.length > 4 ? fields[4].to_i : 2
-        log("Player ##{session.id} requested transfer to Map ##{mid} (#{tx},#{ty})")
-        queue_map_transfer(mid, tx, ty, tdir)
+        if mid == @map_id && tx >= 0 && tx < $game_map.width && ty >= 0 && ty < $game_map.height
+          # Same-map teleport (e.g. Map #116 Ev#2 (9,10) -> (14,16)): move only this player without resetting enemies!
+          session.x = tx
+          session.y = ty
+          session.real_x = tx * 256
+          session.real_y = ty * 256
+          session.dir = tdir if [2, 4, 6, 8].include?(tdir)
+          session.sync_player_obj!
+          log("Player ##{session.id} same-map teleport on Map ##{mid} -> (#{tx},#{ty})")
+          session.queue_frame(Maruchi::Protocol.build_map_transfer(@map_id, tx, ty, session.dir))
+        else
+          log("Player ##{session.id} requested transfer to Map ##{mid} (#{tx},#{ty})")
+          queue_map_transfer(mid, tx, ty, tdir)
+        end
 
       when "REQ_MODE"
         new_mode = Maruchi::Protocol.unesc(fields[1])
