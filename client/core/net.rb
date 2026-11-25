@@ -24,6 +24,8 @@ module Maruchi
     @fn_send = nil
     @fn_poll = nil
     @fn_last_error = nil
+    @fn_bg_run = nil
+    @fn_focused = nil
     @poll_buf = "\0" * 65536
     @err_buf  = "\0" * 1024
 
@@ -51,6 +53,8 @@ module Maruchi
         @fn_send       = Win32API.new(@dll_path, "maruchi_send",       ["p", "l"], "l")
         @fn_poll       = Win32API.new(@dll_path, "maruchi_poll",       ["p", "l"], "l")
         @fn_last_error = Win32API.new(@dll_path, "maruchi_last_error", ["p", "l"], "l")
+        @fn_bg_run     = Win32API.new(@dll_path, "maruchi_enable_background_run", [], "l")
+        @fn_focused    = Win32API.new(@dll_path, "maruchi_window_focused",        [], "l")
         @loaded = true
         Maruchi::Log.info("Loaded maruchi_net.dll from #{@dll_path}")
       rescue Exception => e
@@ -130,6 +134,17 @@ module Maruchi
       n = @fn_last_error.call(@err_buf, @err_buf.length)
       return "" if n <= 0
       @err_buf[0, n]
+    end
+
+    def self.enable_background_run
+      ensure_loaded
+      return false unless @loaded && @fn_bg_run
+      @fn_bg_run.call == 1
+    end
+
+    def self.window_focused?
+      return true unless @loaded && @fn_focused
+      @fn_focused.call == 1
     end
   end
 end

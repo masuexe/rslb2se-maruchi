@@ -18,6 +18,7 @@ module Maruchi
     # Feature / Mod toggles (can be toggled independently)
     MODS = {
       :banner => true,
+      :background_run => true,
       :coop_client => true,
       :mouse_support => false   # Planned QoL mod
     }

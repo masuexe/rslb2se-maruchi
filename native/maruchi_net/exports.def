@@ -6,3 +6,5 @@ EXPORTS
     maruchi_send
     maruchi_poll
     maruchi_last_error
+    maruchi_enable_background_run
+    maruchi_window_focused

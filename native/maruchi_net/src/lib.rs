@@ -4,7 +4,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::raw::c_char;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -298,4 +298,149 @@ pub extern "system" fn maruchi_last_error(buf_ptr: *mut u8, buf_cap: i32) -> i32
         return copy_len as i32;
     }
     0
+}
+
+// ============================================================================
+// Background 60fps Execution & Window Focus Query (Win32 Subclassing)
+// Prevents RGSS202E.dll from freezing Graphics.update when window loses focus.
+// ============================================================================
+#[cfg(windows)]
+mod win_bg {
+    use super::*;
+
+    const GWL_WNDPROC: i32 = -4;
+    const WM_ACTIVATE: u32 = 0x0006;
+    const WM_KILLFOCUS: u32 = 0x0008;
+    const WM_ACTIVATEAPP: u32 = 0x001C;
+    const WM_NCACTIVATE: u32 = 0x0086;
+    const WA_INACTIVE: usize = 0;
+
+    static RGSS_HWND: AtomicIsize = AtomicIsize::new(0);
+    static ORIG_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+
+    type EnumWindowsProc = unsafe extern "system" fn(hwnd: isize, lparam: isize) -> i32;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcessId() -> u32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(cb: EnumWindowsProc, lparam: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        fn GetClassNameW(hwnd: isize, buf: *mut u16, max_count: i32) -> i32;
+        fn SetWindowLongW(hwnd: isize, index: i32, new_long: isize) -> isize;
+        fn CallWindowProcW(
+            prev: isize,
+            hwnd: isize,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> isize;
+        fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn GetForegroundWindow() -> isize;
+        fn IsWindow(hwnd: isize) -> i32;
+    }
+
+    unsafe extern "system" fn enum_find_rgss(hwnd: isize, target_pid: isize) -> i32 {
+        let mut wpid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut wpid);
+        if wpid == (target_pid as u32) {
+            let mut buf = [0u16; 64];
+            let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            if n > 0 {
+                let cls = String::from_utf16_lossy(&buf[..n as usize]);
+                if cls == "RGSS Player" {
+                    RGSS_HWND.store(hwnd, Ordering::SeqCst);
+                    return 0; // stop enumeration
+                }
+            }
+        }
+        1 // continue
+    }
+
+    fn resolve_rgss_hwnd() -> isize {
+        let cur = RGSS_HWND.load(Ordering::SeqCst);
+        if cur != 0 && unsafe { IsWindow(cur) } != 0 {
+            return cur;
+        }
+        RGSS_HWND.store(0, Ordering::SeqCst);
+        let my_pid = unsafe { GetCurrentProcessId() };
+        unsafe {
+            EnumWindows(enum_find_rgss, my_pid as isize);
+        }
+        RGSS_HWND.load(Ordering::SeqCst)
+    }
+
+    unsafe extern "system" fn bg_wndproc(
+        hwnd: isize,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize {
+        match msg {
+            WM_ACTIVATE if (wparam & 0xFFFF) == WA_INACTIVE => return 0,
+            WM_ACTIVATEAPP if wparam == 0 => return 0,
+            WM_KILLFOCUS => return 0,
+            WM_NCACTIVATE => return DefWindowProcW(hwnd, msg, wparam, lparam),
+            _ => {}
+        }
+        let orig = ORIG_WNDPROC.load(Ordering::SeqCst);
+        if orig != 0 {
+            CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+        } else {
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+
+    pub fn enable_background_run() -> i32 {
+        if ORIG_WNDPROC.load(Ordering::SeqCst) != 0 {
+            return 1; // already hooked
+        }
+        let hwnd = resolve_rgss_hwnd();
+        if hwnd == 0 {
+            return 0;
+        }
+        let prev = unsafe { SetWindowLongW(hwnd, GWL_WNDPROC, bg_wndproc as *const () as usize as isize) };
+        if prev != 0 {
+            ORIG_WNDPROC.store(prev, Ordering::SeqCst);
+            1
+        } else {
+            0
+        }
+    }
+
+    pub fn window_focused() -> i32 {
+        let hwnd = resolve_rgss_hwnd();
+        if hwnd == 0 {
+            return 1;
+        }
+        let fg = unsafe { GetForegroundWindow() };
+        if fg == hwnd { 1 } else { 0 }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn maruchi_enable_background_run() -> i32 {
+    #[cfg(windows)]
+    {
+        win_bg::enable_background_run()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn maruchi_window_focused() -> i32 {
+    #[cfg(windows)]
+    {
+        win_bg::window_focused()
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
 }
