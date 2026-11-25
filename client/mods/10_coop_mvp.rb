@@ -403,6 +403,8 @@ if Maruchi::Config::MODS[:coop_client]
       @send_tick = 0
       @ping_tick = 0
       @rtt_ms = nil
+      @last_transfer_req_at = 0.0
+      @last_transfer_req_map = nil
       @last_state = Maruchi::Net::STATE_DISCONNECTED
       @status_note = "F7:Join  F8:Menu"
 
@@ -553,6 +555,12 @@ if Maruchi::Config::MODS[:coop_client]
 
       def self.request_transfer(map_id, x = -1, y = -1, dir = 2)
         return unless connected?
+        now = Time.now.to_f
+        if @last_transfer_req_map == map_id.to_i && (now - @last_transfer_req_at) < 0.6
+          return
+        end
+        @last_transfer_req_map = map_id.to_i
+        @last_transfer_req_at  = now
         Maruchi::Net.send_msg(Maruchi::Protocol.build_req_transfer(map_id, x, y, dir))
       end
 

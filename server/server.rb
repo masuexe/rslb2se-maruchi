@@ -234,6 +234,8 @@ module Maruchi
       @dirty_variables = {}
       @dirty_self_switches = {}
       @pending_transfer = nil
+      @last_transfer_map_id = nil
+      @last_transfer_tick = -999
       @active_context_session = nil
     end
 
@@ -429,10 +431,16 @@ module Maruchi
 
     def transfer_all_to!(map_id, req_x = -1, req_y = -1, dir = 2)
       mid = map_id.to_i
+      # Debounce repeated portal triggers while clients are transitioning
+      if mid == @last_transfer_map_id && (@tick - @last_transfer_tick) < 30
+        return false
+      end
       unless valid_map_id?(mid)
         log("WARN invalid map transfer target: Map ##{mid}")
         return false
       end
+      @last_transfer_map_id = mid
+      @last_transfer_tick   = @tick
 
       $game_map.clear_tokens if $game_map.respond_to?(:clear_tokens)
       $game_map.interpreter.clear if $game_map.interpreter
@@ -639,6 +647,32 @@ module Maruchi
       unless Game_Map.method_defined?(:id)
         Game_Map.class_eval do
           alias_method :id, :map_id
+        end
+      end
+
+      # Replace single-camera XAS Anti-Lag (141_XAS-AntiLag) with multi-player proximity check:
+      # On headless server $game_map.display_x/y stays at (0,0), which previously froze and made
+      # invincible any enemy at x > 22 or y > 18 (and erased bullets fired there!).
+      if Game_Character.method_defined?(:anti_lag_event_on_screen)
+        Game_Character.class_eval do
+          unless method_defined?(:maruchi_orig_anti_lag_on_screen)
+            alias_method :maruchi_orig_anti_lag_on_screen, :anti_lag_event_on_screen
+            def anti_lag_event_on_screen
+              srv = $MARUCHI_SERVER
+              unless srv && !srv.sessions.empty?
+                @can_update = true
+                return
+              end
+              if anti_lag_need_update_out_screen?
+                @can_update = true
+                return
+              end
+              # Active if within 20x16 tiles of ANY connected player
+              @can_update = srv.sessions.each_value.any? do |s|
+                !s.closed && s.authed && ((@x - s.x).abs <= 20) && ((@y - s.y).abs <= 16)
+              end
+            end
+          end
         end
       end
 
@@ -937,9 +971,24 @@ module Maruchi
       end
     end
 
+    # Headless server has no Sprite_Character, so drive enemy collapse countdown, erase,
+    # and hit-hold (@temp_id) release here so enemies never get stuck invulnerable.
     def update_server_enemy_collapses!
       $game_map.events.values.each do |ev|
         next if ev.erased
+        if ev.respond_to?(:temp_id) && ev.temp_id.to_i > 0
+          holder = $game_map.events[ev.temp_id.to_i]
+          if holder.nil? || holder.erased
+            ev.temp_id = 0
+            ev.move_speed = ev.pre_move_speed if ev.respond_to?(:pre_move_speed) && ev.pre_move_speed.to_i > 0
+            ev.knock_back_duration = nil if ev.respond_to?(:knock_back_duration=)
+          else
+            ev.x = holder.x
+            ev.y = holder.y
+            ev.instance_variable_set(:@real_x, holder.real_x)
+            ev.instance_variable_set(:@real_y, holder.real_y)
+          end
+        end
         next unless ev.respond_to?(:battler) && ev.battler.is_a?(Game_Enemy)
         cd = ev.respond_to?(:collapse_duration) ? ev.collapse_duration.to_i : 0
         next unless cd > 0
